@@ -1,4 +1,4 @@
-/**
+﻿/**
  * preset-bridge · 宿主半边
  *
  * 读 <DSH_HOME>/preset-bridge/presets/*.json（SillyTavern chat-completion 预设），
@@ -6,12 +6,13 @@
  * 用户对每块的开关与编辑存进 overrides.json，原预设文件保持只读。
  */
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { existsSync, readdirSync } from 'node:fs'
+import { appendFile, existsSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseCardFile, renderCard } from './cards.js'
 
+// sessions / sessionTitle 是可选的：拿不到就不显示会话标题，不影响主流程
 export const inject = ['systemPrompt', 'webServer']
 
 const ROUTE_PREFIX = '/preset-bridge'
@@ -554,6 +555,19 @@ export function apply(ctx) {
     return lastSid
   }
 
+  // 会话标题（面板上要显示"这个面板绑在哪个对话上"）
+  const titleOf = (sid) => {
+    if (!sid) return ''
+    try {
+      const s = ctx.sessions?.get?.(sid)
+      if (!s) return ''
+      const snap = ctx.sessionTitle?.get?.(s)
+      return snap && snap.title ? String(snap.title) : ''
+    } catch {
+      return ''
+    }
+  }
+
   const state = async (sid) => {
     const key = sid || lastSid
     const cfg = await configFor(key)
@@ -562,6 +576,7 @@ export function apply(ctx) {
     return {
       ...cfg,
       sessionId: key || null,
+      sessionTitle: titleOf(key),
       isDefaultScope: !key,
       presets: await listPresets(),
       cards: await listCards(),
@@ -824,6 +839,24 @@ export function apply(ctx) {
         return sendJson(res, 400, { error: `unknown action: ${action}` })
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  // 探针日志：面板把「认出来的会话 id + 来源 URL」报上来，用来验证探测是否生效
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/probe`,
+    handler: async (req, res) => {
+      if (String(req.method ?? 'GET').toUpperCase() !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const p = await ensureDirs()
+        const line = JSON.stringify({ at: new Date().toISOString(), sid: body.sid ?? null, url: String(body.url || '').slice(0, 300), title: body.title ?? null })
+        await appendFile(join(p.root, 'probe.log'), `${line}\n`, 'utf8')
+        return sendJson(res, 200, { ok: true })
+      } catch (error) {
+        return sendJson(res, 200, { ok: false })
       }
     },
   }))

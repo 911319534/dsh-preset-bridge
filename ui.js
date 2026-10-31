@@ -1,4 +1,4 @@
-﻿/* preset-bridge UI（注入式，不依赖 client 模块系统） */
+/* preset-bridge UI（注入式，不依赖 client 模块系统） */
 (function () {
   if (window.__presetBridgeMounted) return
   window.__presetBridgeMounted = true
@@ -19,10 +19,24 @@
 
   function noteSessionId(url) {
     try {
-      var m = UUID_RE.exec(String(url || ''))
+      var urlStr = String(url || '')
+      var m = UUID_RE.exec(urlStr)
       if (!m) return
       var id = m[1].toLowerCase()
-      if (id === sessionHint) return
+      // 高置信度：URL 路径里带 session/conversation/chat；否则只有在还没绑定时才采纳，
+      // 免得把消息 id 之类的 UUID 误当成会话 id 换来换去
+      var confident = /session|conversation|\/chat\b|chats?\//i.test(urlStr)
+      var accept = confident || !sessionHint
+      // 一律记一条探针日志，方便事后核对到底哪些 URL 带会话 id
+      try {
+        var rawFetch = window.__pbOrigFetch || window.fetch
+        rawFetch.call(window, API + '/probe', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sid: id, url: urlStr, accepted: accept, confident: confident }),
+        })
+      } catch (e) { /* ignore */ }
+      if (!accept || id === sessionHint) return
       // 记住旧会话的面板状态
       if (sessionHint) openBySession[sessionHint] = open
       sessionHint = id
@@ -41,6 +55,7 @@
       var origFetch = window.fetch
       if (typeof origFetch === 'function' && !window.__pbFetchPatched) {
         window.__pbFetchPatched = true
+        window.__pbOrigFetch = origFetch
         window.fetch = function (input) {
           try {
             var u = typeof input === 'string' ? input : (input && input.url) || ''
@@ -109,6 +124,9 @@
     '#pb-panel{position:fixed;right:18px;bottom:142px;z-index:2147483001;width:420px;max-height:66vh;display:flex;flex-direction:column;',
     'border:1px solid var(--pb-border,rgba(255,255,255,.14));border-radius:12px;background:var(--pb-bg,#171b21);',
     'color:var(--dsw-alias-label-primary,#eee);font:12px/1.5 -apple-system,"Segoe UI",sans-serif;box-shadow:0 12px 36px rgba(0,0,0,.55);overflow:hidden}',
+    '#pb-panel .pb-scope{padding:5px 12px;font-size:11px;color:var(--dsw-alias-label-secondary,#aaa);border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.15))}',
+    '#pb-panel .pb-scope.warn{color:#e0b062}',
+    '#pb-fab.unattached{color:#e0b062}',
     '#pb-panel .pb-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
     '#pb-panel .pb-body{padding:8px;overflow:auto}',
     '#pb-panel .pb-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
@@ -240,8 +258,13 @@
     }
     var preset = currentPreset()
     var on = state && state.enabled && preset
-    fab.textContent = on ? ('酒馆 · ' + preset.id) : '酒馆 · 关'
-    fab.className = on ? 'on' : ''
+    // 胶囊上也标出作用域，收起面板时也看得出绑的是哪个对话
+    var scopeTag = sessionHint ? String(sessionHint).slice(-4) : '共享'
+    fab.textContent = on ? ('酒馆 · ' + preset.id + ' · ' + scopeTag) : ('酒馆 · 关 · ' + scopeTag)
+    fab.className = (on ? 'on' : '') + (sessionHint ? '' : ' unattached')
+    fab.title = sessionHint
+      ? ('这个面板只影响当前对话（' + ((state && state.sessionTitle) || sessionHint.slice(0, 8)) + '）')
+      : '没能识别当前对话，设置会写到默认（所有对话共享）'
 
     if (!open) {
       if (panel) panel.remove()
@@ -587,7 +610,8 @@
       el('span', { class: 'pb-meta' }, [on ? (preset.chars + ' 字') : '未启用']),
     ])
 
-    panel = el('div', { id: 'pb-panel' }, [head, body, foot])
+    var scopeBar = el('div', { class: 'pb-scope' + (sessionHint ? '' : ' warn') }, [sessionHint ? ('会话：' + ((state && state.sessionTitle) || String(sessionHint).slice(0, 8)) + '　·　只影响这个对话') : '未能识别当前对话 · 设置会写入默认（所有对话共享）'])
+    panel = el('div', { id: 'pb-panel' }, [head, scopeBar, body, foot])
     host.appendChild(panel)
     if (panelScroll > 0) body.scrollTop = panelScroll
   }
