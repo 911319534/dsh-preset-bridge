@@ -1,4 +1,4 @@
-/* preset-bridge UI（注入式，不依赖 client 模块系统） */
+﻿/* preset-bridge UI（注入式，不依赖 client 模块系统） */
 (function () {
   if (window.__presetBridgeMounted) return
   window.__presetBridgeMounted = true
@@ -179,9 +179,6 @@
   var cardEditId = null
   var roleText = ''
   var roleCustom = false
-  var personaList = []
-  var personaText = ''
-  var personaId = null
   var panelScroll = 0
 
   var css = [
@@ -298,22 +295,6 @@
     }).catch(function (e) { error = String(e.message || e); render() })
   }
 
-  function loadPersonas() {
-    request('/persona').then(function (r) {
-      personaList = (r && r.personas) || []
-      personaId = (r && r.active) || null
-      personaText = (r && r.text) || ''
-      error = ''
-      render()
-    }).catch(function (e) { error = String(e.message || e); render() })
-  }
-
-  function pickPersona(id) {
-    request('/persona', { method: 'POST', body: JSON.stringify({ action: 'select', id: id }) })
-      .then(function (s) { state = s; error = ''; loadPersonas() })
-      .catch(function (e) { error = String(e.message || e); render() })
-  }
-
   function loadRole() {
     request('/role').then(function (r) {
       roleText = r.text || ''
@@ -365,8 +346,7 @@
           : view === 'me' ? '我的设定'
             : view === 'card' ? '角色卡'
               : view === 'base' ? '基础角色'
-                : view === 'persona' ? '人格 · .md'
-                  : '场景预设',
+                : '场景预设',
       ]),
       el('div', { style: 'display:flex;align-items:center;gap:8px' }, [
         view !== 'list'
@@ -417,61 +397,7 @@
     body.addEventListener('scroll', function () { panelScroll = body.scrollTop })
     if (error) body.appendChild(el('div', { class: 'pb-err' }, [error]))
 
-    if (view === 'persona') {
-      var pl = personaList || []
-      body.appendChild(el('div', { class: 'pb-status' }, [
-        personaId ? ('● 本会话人格：' + personaId) : '○ 本会话未选人格（只注入预设 / 卡）',
-      ]))
-      body.appendChild(el('div', {
-        class: 'pb-row' + (personaId ? '' : ' active'),
-        onclick: function () { pickPersona(null) },
-      }, [
-        el('span', { class: 'pb-name' }, ['（不使用人格）']),
-        el('span', { class: 'pb-meta' }, ['—']),
-      ]))
-      pl.forEach(function (p) {
-        var active = p.id === personaId
-        var row = el('div', {
-          class: 'pb-row' + (active ? ' active' : ''),
-          title: '点一下选给本会话',
-          onclick: function () { pickPersona(p.id) },
-        }, [
-          el('span', { class: 'pb-name', style: active ? 'font-weight:700' : '' }, [(active ? '● ' : '') + p.id]),
-          el('span', { class: 'pb-meta' }, [p.chars + ' 字']),
-        ])
-        var del = el('button', { class: 'pb-btn', style: 'padding:1px 7px', title: '删除这个人格文件' }, ['✕'])
-        del.addEventListener('click', function (ev) {
-          ev.stopPropagation()
-          request('/persona', { method: 'POST', body: JSON.stringify({ action: 'delete', id: p.id }) })
-            .then(function (s) { state = s; error = ''; loadPersonas() })
-            .catch(function (e) { error = String(e.message || e); render() })
-        })
-        row.appendChild(del)
-        body.appendChild(row)
-      })
-
-      var nameIn = el('input', { class: 'pb-in', placeholder: '人格文件名（不含 .md）' })
-      nameIn.value = personaId || ''
-      var pta = el('textarea', { class: 'pb-ta', style: 'min-height:200px' })
-      pta.value = personaText
-      pta.addEventListener('input', function () { personaText = pta.value })
-
-      body.appendChild(el('div', { class: 'pb-sep' }, ['人格正文（像 AGENT.md 那样写：我是谁、怎么说话、边界）']))
-      body.appendChild(pta)
-      body.appendChild(el('div', { class: 'pb-foot' }, [
-        nameIn,
-        el('button', {
-          class: 'pb-btn primary',
-          onclick: function () {
-            var id = String(nameIn.value || personaId || '').trim()
-            if (!id) { error = '先填个文件名'; render(); return }
-            request('/persona', { method: 'POST', body: JSON.stringify({ action: 'save', id: id, text: personaText, select: true }) })
-              .then(function (s) { state = s; personaId = id; error = ''; loadPersonas() })
-              .catch(function (e) { error = String(e.message || e); render() })
-          },
-        }, ['保存并选用']),
-      ]))
-    } else if (view === 'base') {
+    if (view === 'base') {
       body.appendChild(el('div', { class: 'pb-sep' }, [
         '基础角色（无卡且有预设时生效）' + (roleCustom ? ' · 已自定义' : ' · 出厂默认'),
       ]))
@@ -596,15 +522,6 @@
       }, [
         el('span', { class: 'pb-name' }, ['（基础角色 · 无卡时生效）']),
         el('span', { class: 'pb-meta' }, [roleCustom ? '已改' : '默认']),
-      ]))
-
-      body.appendChild(el('div', {
-        class: 'pb-row',
-        title: '会话级人格 .md（对应 AGENT.md 那一层，按会话各选一份）',
-        onclick: function () { view = 'persona'; render(); loadPersonas() },
-      }, [
-        el('span', { class: 'pb-name' }, ['（人格 · .md，按会话）']),
-        el('span', { class: 'pb-meta' }, [(state && state.personaFile) ? state.personaFile : '未选']),
       ]))
 
       body.appendChild(el('div', { class: 'pb-foot' }, [

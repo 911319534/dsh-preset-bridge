@@ -1,4 +1,4 @@
-/**
+﻿/**
  * preset-bridge · 宿主半边
  *
  * 读 <DSH_HOME>/preset-bridge/presets/*.json（SillyTavern chat-completion 预设），
@@ -6,7 +6,7 @@
  * 用户对每块的开关与编辑存进 overrides.json，原预设文件保持只读。
  */
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { appendFile, existsSync, readFileSync, readdirSync } from 'node:fs'
+import { appendFile, existsSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -38,7 +38,6 @@ function paths() {
     overrides: join(root, 'overrides.json'),
     presets: join(root, 'presets'),
     cards: join(root, 'cards'),
-    personas: join(root, 'personas'),
     // 用户改过的「基础角色」放这里；包内那份始终是出厂默认
     role: join(root, 'default-role.md'),
   }
@@ -65,52 +64,10 @@ async function readRoleEffective() {
   return { text: await readRoleBuiltin(), custom: false }
 }
 
-// ── 会话级人格（AGENT.md 那一层，按会话各选一份）────────────────────────────
-function safePersonaId(raw) {
-  return String(raw || '')
-    .replace(/\.md$/i, '')
-    .replace(/[\\/:*?"<>|]/g, '_')
-    .trim()
-}
-
-export function listPersonas() {
-  const p = paths()
-  try {
-    return readdirSync(p.personas)
-      .filter((n) => /\.md$/i.test(n))
-      .sort()
-      .map((n) => {
-        const id = n.replace(/\.md$/i, '')
-        let chars = 0
-        try {
-          chars = readFileSync(join(p.personas, n), 'utf8').trim().length
-        } catch {
-          chars = 0
-        }
-        return { id, name: id, chars }
-      })
-  } catch {
-    return []
-  }
-}
-
-export async function readPersona(id) {
-  const safe = safePersonaId(id)
-  if (!safe) return null
-  try {
-    const text = (await readFile(join(paths().personas, `${safe}.md`), 'utf8')).trim()
-    if (!text) return null
-    return { name: safe, text }
-  } catch {
-    return null
-  }
-}
-
 async function ensureDirs() {
   const p = paths()
   await mkdir(p.presets, { recursive: true })
   await mkdir(p.cards, { recursive: true })
-  await mkdir(p.personas, { recursive: true })
   return p
 }
 
@@ -136,8 +93,6 @@ function normalizeConfig(raw = {}) {
     activeCard: typeof raw.activeCard === 'string' && raw.activeCard ? raw.activeCard : null,
     // 没选角色卡时，注入内置的「基础角色」
     useDefaultRole: raw.useDefaultRole !== false,
-    // 这个会话用的「人格」.md（按会话各自一份）
-    personaFile: typeof raw.personaFile === 'string' && raw.personaFile ? raw.personaFile : null,
   }
 }
 
@@ -271,9 +226,7 @@ export function renderPreset(name, blocks, opts = {}) {
   const charName = (opts.charName || '角色').trim() || '角色'
   const persona = typeof opts.userPersona === 'string' ? opts.userPersona.trim() : ''
   const cardText = typeof opts.cardText === 'string' ? opts.cardText.trim() : ''
-  // 会话级「人格」.md（对应 AGENT.md 那一层），跟角色卡分开：人格是"我是谁"，卡是"演谁"
-  const personaDoc = opts.personaDoc && opts.personaDoc.text ? opts.personaDoc : null
-  if (active.length === 0 && !persona && !cardText && !personaDoc) return ''
+  if (active.length === 0 && !persona && !cardText) return ''
   const normalize = (text) => text
     .replace(/\{\{\s*lastMessage\s*\}\}/gi, '')
     .replace(/\{\{\s*user\s*\}\}/gi, userName)
@@ -287,11 +240,8 @@ export function renderPreset(name, blocks, opts = {}) {
       '以下内容来自 SillyTavern 预设，仅在当前启用的场景中生效。',
     )
   }
-  if (active.length > 0 || persona || cardText || personaDoc) {
-    parts.push('（分层优先级：用户当前的明确指令 > 人格 > 我的设定 > 角色卡 > 预设各块；冲突时以前者为准。）')
-  }
-  if (personaDoc) {
-    parts.push('', `### 人格（${personaDoc.name || 'persona'}）`, normalize(personaDoc.text).trim())
+  if (active.length > 0 || persona || cardText) {
+    parts.push('（分层优先级：用户当前的明确指令 > 我的设定 > 角色卡 > 预设各块；冲突时以前者为准。）')
   }
   // ST 的角色卡槽位：/char 块（内容 </{{char}}>）标出卡正文该插在哪，
   // 通常还有配对的 char 块（<{{char}}>）把它包起来。有槽位就填进槽位，
@@ -478,12 +428,7 @@ export function sessionIdOf(context) {
 
 async function currentText(sid) {
   const cfg = await configFor(sid)
-  // 人格是"我是谁"，跟预设开关无关：选了就该一直在
-  const personaDoc = cfg.personaFile ? await readPersona(cfg.personaFile) : null
-  if (!cfg.enabled) {
-    // 预设关着也要保留人格
-    return personaDoc ? renderPreset('', [], { personaDoc }) : ''
-  }
+  if (!cfg.enabled) return ''
   const overrides = await readOverrides()
   let cardText = await activeCardText(cfg, overrides)
   // 基础角色只在「开了预设但没选卡」时兜底；没开预设就不注入，保持干净
@@ -504,7 +449,6 @@ async function currentText(sid) {
     charName: cfg.charName,
     userPersona: cfg.userPersona,
     cardText,
-    personaDoc,
   })
 }
 
@@ -636,11 +580,9 @@ export function apply(ctx) {
       isDefaultScope: !key,
       presets: await listPresets(),
       cards: await listCards(),
-      personas: listPersonas(),
       cardChars: cardText.length,
       dir: paths().presets,
       cardsDir: paths().cards,
-      personasDir: paths().personas,
       chars: (cache.get(key || '__default__') || '').length,
     }
   }
@@ -947,74 +889,6 @@ export function apply(ctx) {
     kind: 'exact',
     path: `${ROUTE_PREFIX}/preview`,
     handler: async (_req, res) => sendJson(res, 200, { chars: (cache.get(lastSid || '__default__') || '').length, text: cache.get(lastSid || '__default__') || '', sessionId: lastSid }),
-  }))
-
-  // 会话级人格：选、存、删（文件在 ~/.dsh/preset-bridge/personas/*.md）
-  disposers.push(ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE_PREFIX}/persona`,
-    handler: async (req, res) => {
-      const method = String(req.method ?? 'GET').toUpperCase()
-      if (method === 'GET') {
-        const sid = sidFromReq(req)
-        const cfg = await configFor(sid)
-        const doc = cfg.personaFile ? await readPersona(cfg.personaFile) : null
-        return sendJson(res, 200, {
-          personas: listPersonas(),
-          active: cfg.personaFile || null,
-          text: doc ? doc.text : '',
-          dir: paths().personas,
-        })
-      }
-      if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
-      try {
-        const body = JSON.parse((await readBody(req)) || '{}')
-        const action = String(body.action || '')
-        const sid = sidFromReq(req, body)
-        const p = await ensureDirs()
-
-        if (action === 'select') {
-          const id = body.id === null ? null : safePersonaId(body.id)
-          await patchSession(sid, { personaFile: id || null })
-          await refresh(sid)
-          return sendJson(res, 200, await state(sid))
-        }
-
-        if (action === 'save') {
-          const id = safePersonaId(body.id)
-          if (!id) return sendJson(res, 400, { error: 'id required' })
-          const text = String(body.text || '')
-          await writeFile(join(p.personas, `${id}.md`), text.slice(0, 40000), 'utf8')
-          if (body.select === true) await patchSession(sid, { personaFile: id })
-          await refresh(sid)
-          return sendJson(res, 200, { ok: true, ...(await state(sid)) })
-        }
-
-        if (action === 'delete') {
-          const id = safePersonaId(body.id)
-          if (!id) return sendJson(res, 400, { error: 'id required' })
-          await rm(join(p.personas, `${id}.md`), { force: true })
-          const raw = migrated(await readConfigRaw())
-          let touched = false
-          for (const [k, patch] of Object.entries(raw.sessions)) {
-            if (patch && patch.personaFile === id) {
-              raw.sessions[k] = { ...patch, personaFile: null }
-              touched = true
-            }
-          }
-          if (touched) {
-            const p2 = await ensureDirs()
-            await writeFile(p2.config, JSON.stringify(raw, null, 2), 'utf8')
-          }
-          await refresh(sid)
-          return sendJson(res, 200, { ok: true, ...(await state(sid)) })
-        }
-
-        return sendJson(res, 400, { error: `unknown action: ${action}` })
-      } catch (error) {
-        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
-      }
-    },
   }))
 
   // 基础角色：读取 / 保存 / 恢复默认
