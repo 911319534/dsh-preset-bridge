@@ -1,4 +1,4 @@
-﻿/**
+/**
  * preset-bridge · 宿主半边
  *
  * 读 <DSH_HOME>/preset-bridge/presets/*.json（SillyTavern chat-completion 预设），
@@ -533,9 +533,10 @@ export function apply(ctx) {
       const key = sid || '__default__'
       const hit = cache.get(key)
       if (hit !== undefined) return hit
-      // 这个会话还没算过：先返回空，同时排一次计算（下一轮就有）
+      // 这个会话第一次装配：先用默认模板顶上（新会话通常就是默认状态），
+      // 同时排一次本会话的计算，下一轮起用会话自己的配置。
       void refresh(sid)
-      return ''
+      return cache.get('__default__') || ''
     },
   })
 
