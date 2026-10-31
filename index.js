@@ -1,0 +1,783 @@
+/**
+ * preset-bridge · 宿主半边
+ *
+ * 读 <DSH_HOME>/preset-bridge/presets/*.json（SillyTavern chat-completion 预设），
+ * 把「启用的文本块」拼成一段系统提示，通过 systemPrompt.section 每轮注入。
+ * 用户对每块的开关与编辑存进 overrides.json，原预设文件保持只读。
+ */
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { existsSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { parseCardFile, renderCard } from './cards.js'
+
+export const inject = ['systemPrompt', 'webServer']
+
+const ROUTE_PREFIX = '/preset-bridge'
+const SECTION_ORDER = 35
+const MAX_BODY = 8 * 1024 * 1024
+const MAX_BLOCK_CHARS = 40000
+
+// ST 内置占位块：内容靠角色卡在运行时填充，DSH 没有对应物
+const PLACEHOLDER_IDS = new Set([
+  'main', 'dialogue', 'chatHist', 'worldInf', 'charDesc', 'charPers',
+  'scenario', 'personaD', 'nsfw', 'jailbreak', 'enhanceDefinitions',
+])
+
+function homeDir() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+function paths() {
+  const root = join(homeDir(), 'preset-bridge')
+  return {
+    root,
+    config: join(root, 'config.json'),
+    overrides: join(root, 'overrides.json'),
+    presets: join(root, 'presets'),
+    cards: join(root, 'cards'),
+    // 用户改过的「基础角色」放这里；包内那份始终是出厂默认
+    role: join(root, 'default-role.md'),
+  }
+}
+
+/** 包内出厂默认的基础角色。 */
+async function readRoleBuiltin() {
+  try {
+    return (await readFile(fileURLToPath(new URL('./default-role.md', import.meta.url)), 'utf8')).trim()
+  } catch {
+    return ''
+  }
+}
+
+/** 生效的基础角色：用户覆盖层优先，否则用出厂默认。 */
+async function readRoleEffective() {
+  const p = paths()
+  try {
+    const custom = (await readFile(p.role, 'utf8')).trim()
+    if (custom) return { text: custom, custom: true }
+  } catch {
+    // 没有用户版本
+  }
+  return { text: await readRoleBuiltin(), custom: false }
+}
+
+async function ensureDirs() {
+  const p = paths()
+  await mkdir(p.presets, { recursive: true })
+  await mkdir(p.cards, { recursive: true })
+  return p
+}
+
+async function readJson(file, fallback) {
+  try {
+    return JSON.parse(await readFile(file, 'utf8'))
+  } catch {
+    return fallback
+  }
+}
+
+async function readConfig() {
+  const p = await ensureDirs()
+  const raw = await readJson(p.config, {})
+  return {
+    enabled: raw.enabled !== false,
+    active: typeof raw.active === 'string' ? raw.active : null,
+    // ST 的 {{user}} / {{char}} 在 DSH 里没有对应字段，用这两项顶替
+    userName: typeof raw.userName === 'string' && raw.userName.trim() ? raw.userName.trim() : '用户',
+    charName: typeof raw.charName === 'string' && raw.charName.trim() ? raw.charName.trim() : '角色',
+    // 「我的设定」：用户自己的人设，注入在预设块之前
+    userPersona: typeof raw.userPersona === 'string' ? raw.userPersona : '',
+    // 角色卡：AI 扮演谁
+    activeCard: typeof raw.activeCard === 'string' ? raw.activeCard : null,
+    // 打开总开关时顺手关掉「鱼的记忆」，避免两套记忆/人设打架
+    syncFishMemory: raw.syncFishMemory !== false,
+    // 只把「我们自己关掉的」负责开回来
+    fishMemoryOff: raw.fishMemoryOff === true,
+    // 没选角色卡时，注入内置的「基础角色」（一个 AI 的身份声明）
+    useDefaultRole: raw.useDefaultRole !== false,
+  }
+}
+
+async function writeConfig(next) {
+  const p = await ensureDirs()
+  await writeFile(p.config, JSON.stringify(next, null, 2), 'utf8')
+}
+
+async function readOverrides() {
+  const p = await ensureDirs()
+  const raw = await readJson(p.overrides, {})
+  return raw && typeof raw === 'object' ? raw : {}
+}
+
+async function writeOverrides(next) {
+  const p = await ensureDirs()
+  await writeFile(p.overrides, JSON.stringify(next, null, 2), 'utf8')
+}
+
+/** 解析 ST 预设 → 全量文本块（含 prompt_order 的默认开关）。 */
+export function parsePreset(raw) {
+  const prompts = Array.isArray(raw?.prompts) ? raw.prompts : []
+  const orderSets = Array.isArray(raw?.prompt_order) ? raw.prompt_order : []
+  // ST 的选择顺序：全局 dummy 集 100001 → 旧 dummy 100000 → 第一个非空组 → 第一组
+  // （有的预设在前面放了一组空 order，直接取第一个会解析出"全关"）
+  const usable = orderSets.filter((entry) => Array.isArray(entry?.order) && entry.order.length > 0)
+  const set = usable.find((entry) => entry.character_id === 100001)
+    ?? usable.find((entry) => entry.character_id === 100000)
+    ?? usable[0]
+    ?? orderSets.find((entry) => Array.isArray(entry?.order))
+    ?? null
+  const enabledById = new Map()
+  let seq = 0
+  if (set) {
+    for (const item of set.order) {
+      if (item && typeof item.identifier === 'string') {
+        enabledById.set(item.identifier, item.enabled !== false)
+      }
+    }
+  }
+
+  const blocks = []
+  for (const p of prompts) {
+    if (!p || typeof p !== 'object') continue
+    const id = typeof p.identifier === 'string' ? p.identifier : `blk-${seq}`
+    seq += 1
+    const content = typeof p.content === 'string' ? p.content : ''
+    // 丢掉「纯脚手架块」：只有宏和 ST 的字段名（|用户：{{user}}|、<{{user}} Description>、
+    // [Understood] 这类）。它们靠 ST 的 user/char persona 字段撑起来，DSH 没有对应物，
+    // 保留下来只会变成一句没有信息量的空壳。
+    const scaffold = content
+      .replace(/\{\{[^}]*\}\}/g, '')
+      .replace(/描述|设定|简介|名字|称呼|description|player|char|user|persona/gi, '')
+      .replace(/[()[\]{}<>\s:：|,，.。\-*_'"]/g, '')
+    if (scaffold === '') continue
+    if (/^\[?\s*(understood|ok|确定)\s*\]?$/i.test(content.trim())) continue
+    const isPlaceholder = PLACEHOLDER_IDS.has(id) || content.trim() === ''
+    blocks.push({
+      id,
+      name: (p.name || id || 'block').trim(),
+      role: p.role || 'system',
+      content,
+      placeholder: isPlaceholder,
+      // ST 只注入 prompt_order 里列出的块；没有 order 表时才默认全开
+      defaultEnabled: set
+        ? enabledById.get(id) === true
+        : true,
+    })
+  }
+  return blocks
+}
+
+/** 套用用户覆盖层，得到最终块集合。 */
+export function applyOverrides(blocks, override = {}) {
+  return blocks.map((b) => {
+    const ov = override[b.id]
+    const content = typeof ov?.content === 'string' ? ov.content : b.content
+    const enabled = typeof ov?.enabled === 'boolean' ? ov.enabled : b.defaultEnabled
+    return {
+      ...b,
+      content,
+      enabled: enabled && !b.placeholder && content.trim() !== '',
+      edited: typeof ov?.content === 'string' && ov.content !== b.content,
+      toggled: typeof ov?.enabled === 'boolean' && ov.enabled !== b.defaultEnabled,
+    }
+  })
+}
+
+export function renderPreset(name, blocks, opts = {}) {
+  const active = blocks.filter((b) => b.enabled)
+  const userName = (opts.userName || '用户').trim() || '用户'
+  const charName = (opts.charName || '角色').trim() || '角色'
+  const persona = typeof opts.userPersona === 'string' ? opts.userPersona.trim() : ''
+  const cardText = typeof opts.cardText === 'string' ? opts.cardText.trim() : ''
+  if (active.length === 0 && !persona && !cardText) return ''
+  const normalize = (text) => text
+    .replace(/\{\{\s*lastMessage\s*\}\}/gi, '')
+    .replace(/\{\{\s*user\s*\}\}/gi, userName)
+    .replace(/\{\{\s*char\s*\}\}/gi, charName)
+    .replace(/\{\{\s*original\s*\}\}/gi, '')
+    .replace(/\{\{\s*persona\s*\}\}/gi, persona)
+  const parts = []
+  if (active.length > 0) {
+    parts.push(
+      `## 场景预设：${name}`,
+      '以下内容来自 SillyTavern 预设，仅在当前启用的场景中生效。',
+    )
+  }
+  if (active.length > 0 || persona || cardText) {
+    parts.push('（分层优先级：用户当前的明确指令 > 我的设定 > 角色卡 > 预设各块；冲突时以前者为准。）')
+  }
+  // 角色卡：AI 扮演谁；放在最前面
+  if (cardText) {
+    parts.push('', normalize(cardText))
+  }
+  // 「我的设定」：玩家自己的身份/处境
+  if (persona) {
+    parts.push('', `### 用户设定（${userName}）`, normalize(persona))
+  }
+  for (const b of active) {
+    parts.push('', `### ${b.name}`, normalize(b.content).trim())
+  }
+  return parts.join('\n').trim()
+}
+
+export function listCardFiles() {
+  const p = paths()
+  try {
+    return readdirSync(p.cards)
+      .filter((n) => /\.(png|json)$/i.test(n))
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/** 读一张卡：优先取用户改过的文本，否则按原卡字段组装。 */
+export async function cardTextOf(id, overrides) {
+  const p = paths()
+  const name = listCardFiles().find((n) => n.replace(/\.(png|json)$/i, '') === id)
+  if (!name) return ''
+  const edited = overrides?.[`card:${id}`]?.text
+  if (typeof edited === 'string' && edited.trim()) return edited.trim()
+  const buf = await readFile(join(p.cards, name))
+  const card = parseCardFile(buf)
+  return card ? renderCard(card) : ''
+}
+
+export async function listCards() {
+  const p = paths()
+  const overrides = await readOverrides()
+  const out = []
+  for (const file of listCardFiles()) {
+    const id = file.replace(/\.(png|json)$/i, '')
+    try {
+      const buf = await readFile(join(p.cards, file))
+      const card = parseCardFile(buf)
+      const text = await cardTextOf(id, overrides)
+      out.push({
+        id,
+        file,
+        name: card?.name ?? id,
+        chars: text.length,
+        edited: typeof overrides?.[`card:${id}`]?.text === 'string',
+        fields: card
+          ? {
+              description: card.description.length,
+              personality: card.personality.length,
+              scenario: card.scenario.length,
+              firstMes: card.firstMes.length,
+              mesExample: card.mesExample.length,
+              greetings: card.alternateGreetings.length,
+            }
+          : null,
+        error: card ? false : true,
+      })
+    } catch {
+      out.push({ id, file, name: id, chars: 0, error: true })
+    }
+  }
+  return out
+}
+
+async function activeCardText(cfg, overrides) {
+  if (!cfg.activeCard) return ''
+  try {
+    return await cardTextOf(cfg.activeCard, overrides)
+  } catch {
+    return ''
+  }
+}
+
+async function loadPresetFile(id) {
+  const p = await ensureDirs()
+  const file = join(p.presets, `${id}.json`)
+  if (!existsSync(file)) return null
+  const raw = await readJson(file, null)
+  if (!raw) return null
+  return raw
+}
+
+async function describePreset(id) {
+  const raw = await loadPresetFile(id)
+  if (!raw) return null
+  const overrides = await readOverrides()
+  const cfg = await readConfig()
+  const blocks = applyOverrides(parsePreset(raw), overrides[id] || {})
+  const text = renderPreset(id, blocks, {
+    userName: cfg.userName,
+    charName: cfg.charName,
+    userPersona: cfg.userPersona,
+  })
+  return {
+    id,
+    blocks: blocks.map((b) => ({
+      id: b.id,
+      name: b.name,
+      role: b.role,
+      enabled: b.enabled,
+      placeholder: b.placeholder,
+      edited: b.edited,
+      toggled: b.toggled,
+      chars: b.content.length,
+      content: b.content,
+      preview: b.content.slice(0, 120),
+    })),
+    chars: text.length,
+    enabledBlocks: blocks.filter((b) => b.enabled).length,
+    text,
+  }
+}
+
+async function listPresets() {
+  const p = await ensureDirs()
+  let names = []
+  try {
+    names = (await readdir(p.presets)).filter((n) => n.toLowerCase().endsWith('.json'))
+  } catch {
+    names = []
+  }
+  const out = []
+  for (const file of names.sort()) {
+    const id = file.replace(/\.json$/i, '')
+    const info = await describePreset(id)
+    if (!info) {
+      out.push({ id, error: true, blocks: [], chars: 0, enabledBlocks: 0 })
+      continue
+    }
+    out.push({
+      id,
+      blocks: info.blocks,
+      chars: info.chars,
+      enabledBlocks: info.enabledBlocks,
+      error: false,
+    })
+  }
+  return out
+}
+
+async function currentText() {
+  const cfg = await readConfig()
+  if (!cfg.enabled) return ''
+  const overrides = await readOverrides()
+  let cardText = await activeCardText(cfg, overrides)
+  // 基础角色只在「开了预设但没选卡」时兜底；没开预设就不注入，保持干净
+  if (!cardText && cfg.useDefaultRole && cfg.active) {
+    cardText = (await readRoleEffective()).text
+  }
+  let blocks = []
+  let presetName = ''
+  if (cfg.active) {
+    const raw = await loadPresetFile(cfg.active)
+    if (raw) {
+      presetName = cfg.active
+      blocks = applyOverrides(parsePreset(raw), overrides[cfg.active] || {})
+    }
+  }
+  return renderPreset(presetName, blocks, {
+    userName: cfg.userName,
+    charName: cfg.charName,
+    userPersona: cfg.userPersona,
+    cardText,
+  })
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY) {
+        reject(new Error('body too large'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
+function sendJson(res, status, obj) {
+  const text = JSON.stringify(obj)
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    'cache-control': 'no-store',
+  })
+  res.end(text)
+}
+
+export function apply(ctx) {
+  const cache = { text: '' }
+
+  // ── 注入式 UI ────────────────────────────────────────────────────────────
+  // 不走 client 模块系统（那条路在这台机器上加载失败），改为往 index.html
+  // 注入一段自己的脚本，画一个浮动按钮 + 面板。文件按请求读，改完刷新即生效。
+  const uiPath = fileURLToPath(new URL('./ui.js', import.meta.url))
+  const disposeUi = ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/ui.js`,
+    handler: async (_req, res) => {
+      try {
+        const text = await readFile(uiPath, 'utf8')
+        res.writeHead(200, {
+          'content-type': 'text/javascript; charset=utf-8',
+          'content-length': Buffer.byteLength(text),
+          'cache-control': 'no-store',
+        })
+        res.end(text)
+      } catch (error) {
+        res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end(String(error))
+      }
+    },
+  })
+  const disposeTap = ctx.webServer.tapIndex((html) => {
+    const tag = `<script src="${ROUTE_PREFIX}/ui.js" defer></script>`
+    if (html.includes(`${ROUTE_PREFIX}/ui.js`)) return html
+    return html.includes('</body>') ? html.replace('</body>', `${tag}</body>`) : html + tag
+  })
+
+  const refresh = async () => {
+    cache.text = await currentText()
+    return cache.text
+  }
+
+  ctx.systemPrompt.section({
+    name: 'preset-bridge:scene',
+    order: SECTION_ORDER,
+    // 预设原文含 SillyTavern 宏（{{user}}/{{char}}/{{lastMessage}} 等），
+    // 而 DSH 会对 section 文本做严格 {{变量}} 插值：遇到未注册变量直接抛错，
+    // 导致整轮 agent turn 失败。这里关闭插值，原样注入预设文本。
+    interpolate: false,
+    text: () => cache.text,
+  })
+
+  void refresh()
+
+  const state = async () => {
+    const cfg = await readConfig()
+    const overrides = await readOverrides()
+    const cardText = await activeCardText(cfg, overrides)
+    return {
+      ...cfg,
+      presets: await listPresets(),
+      cards: await listCards(),
+      cardChars: cardText.length,
+      dir: paths().presets,
+      cardsDir: paths().cards,
+      chars: cache.text.length,
+    }
+  }
+
+  const disposers = []
+
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/state`,
+    handler: async (req, res) => {
+      const method = String(req.method ?? 'GET').toUpperCase()
+      if (method === 'GET') return sendJson(res, 200, await state())
+      if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const cfg = await readConfig()
+        const next = {
+          enabled: typeof body.enabled === 'boolean' ? body.enabled : cfg.enabled,
+          active: body.active === null
+            ? null
+            : typeof body.active === 'string'
+              ? body.active
+              : cfg.active,
+          userName: typeof body.userName === 'string' ? body.userName.slice(0, 60) : cfg.userName,
+          charName: typeof body.charName === 'string' ? body.charName.slice(0, 60) : cfg.charName,
+          userPersona: typeof body.userPersona === 'string'
+            ? body.userPersona.slice(0, 8000)
+            : cfg.userPersona,
+          syncFishMemory: typeof body.syncFishMemory === 'boolean' ? body.syncFishMemory : cfg.syncFishMemory,
+          fishMemoryOff: cfg.fishMemoryOff,
+        }
+        if (body.enabled === true && !next.active) {
+          const presets = await listPresets()
+          next.active = presets.find((x) => !x.error)?.id ?? null
+        }
+
+        // 与「鱼的记忆」联动：开预设就关它，关预设就还它。
+        // 只操作我们自己关掉的那次（fishMemoryOff 记账），不碰用户手动关的状态。
+        const turningOn = next.enabled && !cfg.enabled
+        const turningOff = !next.enabled && cfg.enabled
+        const pm = ctx.get?.('pluginManager') ?? ctx.pluginManager
+        const FISH = 'dsh-fish-memory'
+        if (next.syncFishMemory && pm && (turningOn || turningOff)) {
+          try {
+            if (turningOn) {
+              const list = await pm.listBundles()
+              const bundle = Array.isArray(list) ? list.find((b) => b?.name === FISH) : undefined
+              if (bundle?.enabled) {
+                await pm.setBundleEnabled(FISH, false)
+                next.fishMemoryOff = true
+              }
+            } else if (cfg.fishMemoryOff) {
+              await pm.setBundleEnabled(FISH, true)
+              next.fishMemoryOff = false
+            }
+          } catch (error) {
+            // 联动失败不阻断开关本身，但把原因带回去
+            next.fishMemoryError = error instanceof Error ? error.message : String(error)
+          }
+        }
+
+        await writeConfig(next)
+        await refresh()
+        return sendJson(res, 200, await state())
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  // 单块开关 / 内容编辑
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/block`,
+    handler: async (req, res) => {
+      if (String(req.method ?? '').toUpperCase() !== 'POST') {
+        return sendJson(res, 405, { error: 'method not allowed' })
+      }
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const preset = typeof body.preset === 'string' ? body.preset : ''
+        const block = typeof body.block === 'string' ? body.block : ''
+        if (!preset || !block) return sendJson(res, 400, { error: 'preset/block required' })
+
+        const raw = await loadPresetFile(preset)
+        if (!raw) return sendJson(res, 404, { error: 'preset not found' })
+        const known = parsePreset(raw).find((b) => b.id === block)
+        if (!known) return sendJson(res, 404, { error: 'block not found' })
+
+        const overrides = await readOverrides()
+        const perPreset = { ...(overrides[preset] || {}) }
+        const entry = { ...(perPreset[block] || {}) }
+
+        if (typeof body.enabled === 'boolean') entry.enabled = body.enabled
+        if (typeof body.content === 'string') {
+          entry.content = body.content.slice(0, MAX_BLOCK_CHARS)
+        }
+        if (body.reset === true) {
+          delete entry.content
+          delete entry.enabled
+        }
+        if (Object.keys(entry).length === 0) delete perPreset[block]
+        else perPreset[block] = entry
+
+        overrides[preset] = perPreset
+        await writeOverrides(overrides)
+        await refresh()
+        return sendJson(res, 200, await state())
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  // 导入预设 JSON
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/import`,
+    handler: async (req, res) => {
+      if (String(req.method ?? '').toUpperCase() !== 'POST') {
+        return sendJson(res, 405, { error: 'method not allowed' })
+      }
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const name = String(body.name || '').replace(/[\\/:*?"<>|]/g, '_').replace(/\.json$/i, '').trim()
+        if (!name) return sendJson(res, 400, { error: 'name required' })
+        const content = body.content
+        const parsed = typeof content === 'string' ? JSON.parse(content) : content
+        if (!parsed || !Array.isArray(parsed.prompts)) {
+          return sendJson(res, 400, { error: '不是 SillyTavern 预设（缺少 prompts 数组）' })
+        }
+        const p = await ensureDirs()
+        await writeFile(join(p.presets, `${name}.json`), JSON.stringify(parsed, null, 2), 'utf8')
+        await refresh()
+        return sendJson(res, 200, { ok: true, id: name, ...(await state()) })
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  // 删除预设（连同它的块覆盖层）
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/delete`,
+    handler: async (req, res) => {
+      if (String(req.method ?? '').toUpperCase() !== 'POST') {
+        return sendJson(res, 405, { error: 'method not allowed' })
+      }
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const id = String(body.id || '').replace(/[\\/:*?"<>|]/g, '_').replace(/\.json$/i, '').trim()
+        if (!id) return sendJson(res, 400, { error: 'id required' })
+        const p = await ensureDirs()
+        const file = join(p.presets, `${id}.json`)
+        if (!existsSync(file)) return sendJson(res, 404, { error: 'preset not found' })
+        await rm(file, { force: true })
+        const overrides = await readOverrides()
+        if (overrides[id]) {
+          delete overrides[id]
+          await writeOverrides(overrides)
+        }
+        const cfg = await readConfig()
+        if (cfg.active === id) await writeConfig({ ...cfg, active: null })
+        await refresh()
+        return sendJson(res, 200, { ok: true, ...(await state()) })
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  // ── 角色卡 ────────────────────────────────────────────────────────────────
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/card`,
+    handler: async (req, res) => {
+      const method = String(req.method ?? 'GET').toUpperCase()
+      if (method === 'GET') {
+        const url = new URL(String(req.url || '/'), 'http://x')
+        const wantId = url.searchParams.get('id')
+        if (wantId) {
+          const overrides = await readOverrides()
+          const text = await cardTextOf(wantId, overrides)
+          return sendJson(res, 200, { id: wantId, text })
+        }
+        return sendJson(res, 200, { cards: await listCards(), activeCard: (await readConfig()).activeCard })
+      }
+      if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const action = String(body.action || '')
+
+        if (action === 'import') {
+          const bytes = Buffer.from(String(body.data || ''), 'base64')
+          if (bytes.length === 0) return sendJson(res, 400, { error: 'empty file' })
+          if (bytes.length > 20 * 1024 * 1024) return sendJson(res, 400, { error: 'file too large (>20MB)' })
+          const card = parseCardFile(bytes)
+          if (!card) return sendJson(res, 400, { error: '不是可识别的角色卡（支持 PNG 角色卡 / chara_card_v2 JSON）' })
+          const base = String(body.name || card.name || 'card')
+            .replace(/\.(png|json)$/i, '')
+            .replace(/[\\/:*?"<>|]/g, '_')
+            .trim() || 'card'
+          const ext = /\.json$/i.test(String(body.name || '')) ? 'json' : 'png'
+          const p = await ensureDirs()
+          await writeFile(join(p.cards, `${base}.${ext}`), bytes)
+          await writeConfig({ ...(await readConfig()), activeCard: base })
+          await refresh()
+          return sendJson(res, 200, { ok: true, id: base, name: card.name, ...(await state()) })
+        }
+
+        if (action === 'select') {
+          const cfg = await readConfig()
+          const id = body.id === null ? null : String(body.id || '')
+          await writeConfig({ ...cfg, activeCard: id })
+          await refresh()
+          return sendJson(res, 200, await state())
+        }
+
+        if (action === 'text') {
+          const id = String(body.id || '')
+          if (!id) return sendJson(res, 400, { error: 'id required' })
+          const overrides = await readOverrides()
+          const key = `card:${id}`
+          if (typeof body.text === 'string' && body.text.trim()) {
+            overrides[key] = { text: body.text.slice(0, 40000) }
+          } else {
+            delete overrides[key]
+          }
+          await writeOverrides(overrides)
+          await refresh()
+          return sendJson(res, 200, await state())
+        }
+
+        if (action === 'delete') {
+          const id = String(body.id || '')
+          const p = await ensureDirs()
+          const file = listCardFiles().find((n) => n.replace(/\.(png|json)$/i, '') === id)
+          if (!file) return sendJson(res, 404, { error: 'card not found' })
+          await rm(join(p.cards, file), { force: true })
+          const overrides = await readOverrides()
+          delete overrides[`card:${id}`]
+          await writeOverrides(overrides)
+          const cfg = await readConfig()
+          if (cfg.activeCard === id) await writeConfig({ ...cfg, activeCard: null })
+          await refresh()
+          return sendJson(res, 200, { ok: true, ...(await state()) })
+        }
+
+        return sendJson(res, 400, { error: `unknown action: ${action}` })
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/preview`,
+    handler: async (_req, res) => sendJson(res, 200, { chars: cache.text.length, text: cache.text }),
+  }))
+
+  // 基础角色：读取 / 保存 / 恢复默认
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/role`,
+    handler: async (req, res) => {
+      const method = String(req.method ?? 'GET').toUpperCase()
+      if (method === 'GET') {
+        const eff = await readRoleEffective()
+        return sendJson(res, 200, {
+          text: eff.text,
+          custom: eff.custom,
+          builtin: await readRoleBuiltin(),
+        })
+      }
+      if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const p = await ensureDirs()
+        if (body.reset === true) {
+          await rm(p.role, { force: true })
+        } else if (typeof body.text === 'string') {
+          const text = body.text.trim()
+          if (!text) {
+            await rm(p.role, { force: true })
+          } else {
+            await writeFile(p.role, body.text.slice(0, 20000), 'utf8')
+          }
+        }
+        await refresh()
+        const eff = await readRoleEffective()
+        return sendJson(res, 200, { ok: true, text: eff.text, custom: eff.custom, ...(await state()) })
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  disposers.push(disposeUi)
+  disposers.push(disposeTap)
+
+  ctx.effect?.(() => () => {
+    for (const dispose of disposers) {
+      try {
+        dispose()
+      } catch {
+        // ignore
+      }
+    }
+  })
+}

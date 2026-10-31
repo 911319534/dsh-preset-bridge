@@ -1,0 +1,40 @@
+{
+  "name": "@local/preset-bridge",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "把 SillyTavern 的预设与角色卡接进普通 DSH 会话：浮动面板切换/开关预设，按块注入系统提示。",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "sillytavern",
+    "preset",
+    "character-card",
+    "roleplay"
+  ],
+  "license": "MIT",
+  "author": "DeepSeek V4.1 (model-generated)",
+  "exports": {
+    ".": "./index.js",
+    "./ui": "./ui.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "ui.js",
+    "cards.js",
+    "default-role.md",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

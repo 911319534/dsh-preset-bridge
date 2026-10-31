@@ -1,0 +1,3 @@
+- insert:
+    - id: preset-bridge
+      name: '@local/preset-bridge'

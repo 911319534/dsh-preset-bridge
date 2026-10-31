@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Scene Presets",
+    "description": "Bring SillyTavern presets into normal DSH sessions: switch and toggle presets beside the composer, injected as a system-prompt section."
+  }
+}

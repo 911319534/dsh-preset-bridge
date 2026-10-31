@@ -1,0 +1,545 @@
+/* preset-bridge UI（注入式，不依赖 client 模块系统） */
+(function () {
+  if (window.__presetBridgeMounted) return
+  window.__presetBridgeMounted = true
+
+  var API = '/preset-bridge'
+  var state = null
+  var open = false
+  var view = 'list'
+  var editing = null
+
+  // ── 显示层解码：把正文里的 \uXXXX 还原成汉字（只改显示，不改模型行为）──
+  // 默认关闭：全局扫描/改写文本会把主线程拖死，且与开屏类插件抢 DOM。
+  // 需要时手动在控制台设 localStorage.setItem('pb-decode','1') 再刷新。
+  var decodeOn = localStorage.getItem('pb-decode') === '1'
+  var decoding = false
+  function decodeText(s) {
+    return String(s).replace(/\\u([0-9a-fA-F]{4})/g, function (all, hex) {
+      try { return String.fromCharCode(parseInt(hex, 16)) } catch (e) { return all }
+    })
+  }
+  function decodeWalk(node) {
+    if (!node) return
+    if (node.nodeType === 3) {
+      var p = node.parentNode
+      if (p && /^(SCRIPT|STYLE|CODE|PRE|TEXTAREA)$/.test(p.nodeName)) return
+      if (node.nodeValue && node.nodeValue.indexOf('\\u') !== -1) {
+        node.nodeValue = decodeText(node.nodeValue)
+      }
+      return
+    }
+    if (node.nodeType !== 1) return
+    for (var i = 0; i < node.childNodes.length; i++) decodeWalk(node.childNodes[i])
+  }
+  // 去掉全文档 MutationObserver：页面每次渲染都会触发它，遍历+改写文本节点
+  // 会持续占用主线程，导致 Renderer 无法上报 boot health，启动直接卡死。
+  try {
+    if (decodeOn) setTimeout(function () { decodeWalk(document.body) }, 800)
+  } catch (e) { /* ignore */ }
+
+  var draft = ''
+  var error = ''
+  var pendingDelete = null
+  var meName = '用户'
+  var mePersona = ''
+  var cardText = ''
+  var cardEditId = null
+  var roleText = ''
+  var roleCustom = false
+  var panelScroll = 0
+
+  var css = [
+    '#pb-fab{position:fixed;right:18px;bottom:104px;z-index:2147483000;display:flex;align-items:center;gap:6px;height:30px;padding:0 12px;border-radius:15px;',
+    'border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.4));background:var(--dsw-alias-bg-overlay,#1b1f24);color:var(--dsw-alias-label-secondary,#ccc);',
+    'font:12px/1 -apple-system,"Segoe UI",sans-serif;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.28);opacity:.92}',
+    '#pb-fab.on{border-color:var(--dsw-alias-brand-primary,#4a9eff);color:var(--dsw-alias-brand-primary,#4a9eff)}',
+    '#pb-fab:hover{opacity:1}',
+    '#pb-panel{position:fixed;right:18px;bottom:142px;z-index:2147483001;width:420px;max-height:66vh;display:flex;flex-direction:column;',
+    'border:1px solid var(--pb-border,rgba(255,255,255,.14));border-radius:12px;background:var(--pb-bg,#171b21);',
+    'color:var(--dsw-alias-label-primary,#eee);font:12px/1.5 -apple-system,"Segoe UI",sans-serif;box-shadow:0 12px 36px rgba(0,0,0,.55);overflow:hidden}',
+    '#pb-panel .pb-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
+    '#pb-panel .pb-body{padding:8px;overflow:auto}',
+    '#pb-panel .pb-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
+    '.pb-row{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:6px;cursor:pointer}',
+    '.pb-row:hover{background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.16))}',
+    '.pb-row.active{background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.22))}',
+    '.pb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.pb-meta{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;white-space:nowrap}',
+    '.pb-btn{padding:3px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.4));background:transparent;color:inherit;font-size:12px;cursor:pointer}',
+    '.pb-btn.primary{border-color:var(--dsw-alias-brand-primary,#4a9eff);color:var(--dsw-alias-brand-primary,#4a9eff)}',
+    '.pb-ta{width:100%;box-sizing:border-box;min-height:200px;padding:8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.4));',
+    'background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.12));color:inherit;font:12px/1.55 inherit;resize:vertical}',
+    '.pb-err{color:#ff7a7a;padding:4px 8px}',
+    '.pb-status{padding:6px 8px;margin-bottom:6px;border-radius:6px;background:rgba(255,255,255,.07);',
+    'color:var(--dsw-alias-label-secondary,#ccc);font-size:11px;line-height:1.7;word-break:break-all}',
+    '.pb-in{width:100%;box-sizing:border-box;padding:6px 8px;border-radius:8px;border:1px solid var(--pb-border,rgba(255,255,255,.14));',
+    'background:rgba(255,255,255,.06);color:inherit;font:12px/1.4 inherit}',
+    '.pb-sep{padding:8px 6px 2px;color:var(--dsw-alias-label-tertiary,#999);font-size:11px}',
+  ].join('')
+
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag)
+    if (attrs) {
+      for (var k in attrs) {
+        if (k === 'style') node.setAttribute('style', attrs[k])
+        else if (k.slice(0, 2) === 'on') node.addEventListener(k.slice(2).toLowerCase(), attrs[k])
+        else if (attrs[k] !== undefined && attrs[k] !== null) node.setAttribute(k, attrs[k])
+      }
+    }
+    ;(children || []).forEach(function (c) {
+      if (c === null || c === undefined) return
+      node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c)
+    })
+    return node
+  }
+
+  function request(path, init) {
+    return fetch(API + path, Object.assign({
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+    }, init || {})).then(function (res) {
+      return res.json().catch(function () { return {} }).then(function (data) {
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status))
+        return data
+      })
+    })
+  }
+
+  function refresh() {
+    return request('/state').then(function (s) {
+      state = s
+      error = ''
+      render()
+    }).catch(function (e) {
+      error = String(e.message || e)
+      render()
+    })
+  }
+
+  function currentPreset() {
+    if (!state || !state.active) return null
+    return (state.presets || []).filter(function (p) { return p.id === state.active })[0] || null
+  }
+
+  function applyPatch(patch) {
+    request('/state', { method: 'POST', body: JSON.stringify(patch) }).then(function (s) {
+      state = s; error = ''; render()
+    }).catch(function (e) { error = String(e.message || e); render() })
+  }
+
+  function patchBlock(blockId, body) {
+    body.preset = state.active
+    body.block = blockId
+    request('/block', { method: 'POST', body: JSON.stringify(body) }).then(function (s) {
+      state = s; error = ''; render()
+    }).catch(function (e) { error = String(e.message || e); render() })
+  }
+
+  var root = null
+
+  function loadCardText(id) {
+    if (!id) { cardText = ''; cardEditId = null; render(); return }
+    cardEditId = id
+    request('/card?id=' + encodeURIComponent(id)).then(function (r) {
+      cardText = r.text || ''
+      render()
+    }).catch(function (e) { error = String(e.message || e); render() })
+  }
+
+  function loadRole() {
+    request('/role').then(function (r) {
+      roleText = r.text || ''
+      roleCustom = !!r.custom
+      render()
+    }).catch(function (e) { error = String(e.message || e); render() })
+  }
+
+  function ensureRoot() {
+    if (root && document.body.contains(root)) return root
+    root = el('div', { id: 'pb-root' })
+    root.appendChild(el('style', null, [css]))
+    document.body.appendChild(root)
+    return root
+  }
+
+  function render() {
+    var host = ensureRoot()
+    var fab = document.getElementById('pb-fab')
+    var panel = document.getElementById('pb-panel')
+    if (!fab) {
+      fab = el('button', { id: 'pb-fab', type: 'button', onclick: function () { open = !open; view = 'list'; render() } })
+      host.appendChild(fab)
+    }
+    var preset = currentPreset()
+    var on = state && state.enabled && preset
+    fab.textContent = on ? ('酒馆 · ' + preset.id) : '酒馆 · 关'
+    fab.className = on ? 'on' : ''
+
+    if (!open) {
+      if (panel) panel.remove()
+      return
+    }
+    if (panel) panel.remove()
+
+    var enabledNow = !!(state && state.enabled)
+    var head = el('div', { class: 'pb-head' }, [
+      el('strong', null, [
+        view === 'edit' ? '编辑块'
+          : view === 'me' ? '我的设定'
+            : view === 'card' ? '角色卡'
+              : view === 'base' ? '基础角色'
+                : '场景预设',
+      ]),
+      el('div', { style: 'display:flex;align-items:center;gap:8px' }, [
+        view !== 'list'
+          ? el('button', { class: 'pb-btn', onclick: function () { view = 'list'; render() } }, ['← 返回'])
+          : el('button', {
+              class: 'pb-btn' + (enabledNow ? ' primary' : ''),
+              style: 'min-width:84px;font-weight:600',
+              title: enabledNow ? '一键关掉整套酒馆系统（预设/卡/人设全部停止注入）' : '一键开启整套酒馆系统',
+              onclick: function () { applyPatch({ enabled: !enabledNow }) },
+            }, [enabledNow ? '● 整套开启' : '○ 整套关闭']),
+        el('button', {
+          class: 'pb-btn', title: '从磁盘重新读取',
+          onclick: function () { refresh() },
+        }, ['↻']),
+        el('button', {
+          class: 'pb-btn', title: '角色卡（AI 扮演谁）',
+          onclick: function () {
+            view = 'card'
+            render()
+            loadCardText(state && state.activeCard)
+          },
+        }, ['卡']),
+        el('button', {
+          class: 'pb-btn' + (decodeOn ? ' primary' : ''),
+          title: decodeOn ? '已开启：正文里的 \\uXXXX 自动解码成汉字（只改显示）' : '已关闭：原样显示转义内容',
+          onclick: function () {
+            decodeOn = !decodeOn
+            try { localStorage.setItem('pb-decode', decodeOn ? '1' : '0') } catch (e) { /* ignore */ }
+            if (decodeOn) decodeWalk(document.body)
+            render()
+          },
+        }, ['解']),
+        el('button', {
+          class: 'pb-btn', title: '我的设定（用户名 · 人设）',
+          onclick: function () {
+            meName = (state && state.userName) || '用户'
+            mePersona = (state && state.userPersona) || ''
+            view = 'me'
+            render()
+          },
+        }, ['我']),
+        el('button', { class: 'pb-btn', onclick: function () { open = false; render() } }, ['×']),
+      ]),
+    ])
+
+    var body = el('div', { class: 'pb-body' })
+    // 重绘会丢滚动位置（点一个块就跳回顶部），这里记住再还原
+    body.addEventListener('scroll', function () { panelScroll = body.scrollTop })
+    if (error) body.appendChild(el('div', { class: 'pb-err' }, [error]))
+
+    if (view === 'base') {
+      body.appendChild(el('div', { class: 'pb-sep' }, [
+        '基础角色（无卡且有预设时生效）' + (roleCustom ? ' · 已自定义' : ' · 出厂默认'),
+      ]))
+      var rta = el('textarea', { class: 'pb-ta', style: 'min-height:260px' })
+      rta.value = roleText
+      rta.addEventListener('input', function () { roleText = rta.value })
+      body.appendChild(rta)
+      body.appendChild(el('div', { class: 'pb-foot' }, [
+        el('button', {
+          class: 'pb-btn',
+          title: '删除自定义版本，回到包内出厂默认',
+          onclick: function () {
+            request('/role', { method: 'POST', body: JSON.stringify({ reset: true }) })
+              .then(function (r) { roleText = r.text; roleCustom = false; error = ''; render() })
+              .catch(function (e) { error = String(e.message || e); render() })
+          },
+        }, ['恢复默认']),
+        el('span', { class: 'pb-meta' }, [roleText.length + ' 字']),
+        el('button', {
+          class: 'pb-btn primary',
+          onclick: function () {
+            request('/role', { method: 'POST', body: JSON.stringify({ text: roleText }) })
+              .then(function (r) { roleText = r.text; roleCustom = r.custom; error = ''; render() })
+              .catch(function (e) { error = String(e.message || e); render() })
+          },
+        }, ['保存']),
+      ]))
+    } else if (view === 'card') {
+      var cards = (state && state.cards) || []
+      var activeCardId = (state && state.activeCard) || ''
+      body.appendChild(el('div', { class: 'pb-status' }, [
+        activeCardId ? ('● 正在使用：' + activeCardId) : '○ 未使用角色卡 → 使用内置「基础角色」',
+      ]))
+      body.appendChild(el('div', {
+        class: 'pb-row' + (activeCardId ? '' : ' active'),
+        onclick: function () {
+          request('/card', { method: 'POST', body: JSON.stringify({ action: 'select', id: null }) })
+            .then(function (s) { state = s; error = ''; cardText = ''; cardEditId = null; render() })
+            .catch(function (e) { error = String(e.message || e); render() })
+        },
+      }, [
+        el('span', { class: 'pb-name' }, ['（不使用任何卡）']),
+        el('span', { class: 'pb-meta' }, ['—']),
+      ]))
+      if (cards.length === 0) {
+        body.appendChild(el('div', { class: 'pb-sep' }, ['还没有角色卡。点下面「导入卡」选一张 PNG 或 JSON。']))
+      }
+      cards.forEach(function (c) {
+        var isActive = c.id === activeCardId
+        var row = el('div', {
+          class: 'pb-row' + (isActive ? ' active' : ''),
+          title: c.error ? '解析失败' : (c.name + ' · ' + c.chars + ' 字'),
+          onclick: function () {
+            request('/card', { method: 'POST', body: JSON.stringify({ action: 'select', id: c.id }) })
+              .then(function (s) { state = s; error = ''; loadCardText(c.id) })
+              .catch(function (e) { error = String(e.message || e); render() })
+          },
+        }, [
+          el('span', { class: 'pb-name', style: isActive ? 'font-weight:700' : '' },
+            [(isActive ? '● ' : '') + (c.name || c.id) + (c.edited ? ' *' : '')]),
+          el('span', { class: 'pb-meta' }, [c.error ? '!' : (isActive ? '使用中' : (c.chars + ' 字'))]),
+        ])
+        var del = el('button', { class: 'pb-btn', style: 'padding:1px 7px', title: '删除这张卡' }, ['✕'])
+        del.addEventListener('click', function (ev) {
+          ev.stopPropagation()
+          request('/card', { method: 'POST', body: JSON.stringify({ action: 'delete', id: c.id }) })
+            .then(function (s) { state = s; error = ''; cardText = ''; cardEditId = null; render() })
+            .catch(function (e) { error = String(e.message || e); render() })
+        })
+        row.appendChild(del)
+        body.appendChild(row)
+      })
+
+      // 导入
+      var fileInput = el('input', { type: 'file', accept: '.png,.json,image/png,application/json', style: 'display:none' })
+      fileInput.addEventListener('change', function () {
+        var f = fileInput.files && fileInput.files[0]
+        fileInput.value = ''
+        if (!f) return
+        var reader = new FileReader()
+        reader.onload = function () {
+          var dataUrl = String(reader.result || '')
+          var b64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+          request('/card', { method: 'POST', body: JSON.stringify({ action: 'import', name: f.name, data: b64 }) })
+            .then(function (s) { state = s; error = ''; loadCardText(s.activeCard) })
+            .catch(function (e) { error = String(e.message || e); render() })
+        }
+        reader.readAsDataURL(f)
+      })
+
+      if (state && state.activeCard) {
+        body.appendChild(el('div', { class: 'pb-sep' }, ['卡面文本（可改，改完点保存）']))
+        var cta = el('textarea', { class: 'pb-ta', style: 'min-height:220px' })
+        cta.value = cardText
+        cta.addEventListener('input', function () { cardText = cta.value })
+        body.appendChild(cta)
+        body.appendChild(el('div', { class: 'pb-foot' }, [
+          el('button', {
+            class: 'pb-btn',
+            onclick: function () {
+              request('/card', { method: 'POST', body: JSON.stringify({ action: 'text', id: state.activeCard, text: '' }) })
+                .then(function (s) { state = s; error = ''; loadCardText(state.activeCard) })
+                .catch(function (e) { error = String(e.message || e); render() })
+            },
+          }, ['恢复默认']),
+          el('span', { class: 'pb-meta' }, [cardText.length + ' 字']),
+          el('button', {
+            class: 'pb-btn primary',
+            onclick: function () {
+              request('/card', { method: 'POST', body: JSON.stringify({ action: 'text', id: state.activeCard, text: cardText }) })
+                .then(function (s) { state = s; error = ''; render() })
+                .catch(function (e) { error = String(e.message || e); render() })
+            },
+          }, ['保存']),
+        ]))
+      }
+
+      body.appendChild(el('div', {
+        class: 'pb-row',
+        title: '没有角色卡时注入的身份声明（可编辑）',
+        onclick: function () { view = 'base'; render(); loadRole() },
+      }, [
+        el('span', { class: 'pb-name' }, ['（基础角色 · 无卡时生效）']),
+        el('span', { class: 'pb-meta' }, [roleCustom ? '已改' : '默认']),
+      ]))
+
+      body.appendChild(el('div', { class: 'pb-foot' }, [
+        el('button', { class: 'pb-btn', onclick: function () { fileInput.click() } }, ['导入卡']),
+        fileInput,
+        el('span', { class: 'pb-meta' }, [cards.length + ' 张']),
+      ]))
+    } else if (view === 'me') {
+      var nameInput = el('input', { type: 'text', class: 'pb-in', placeholder: '称呼（{{user}} 会替换成它）' })
+      nameInput.value = meName
+      nameInput.addEventListener('input', function () { meName = nameInput.value })
+
+      var personaTa = el('textarea', { class: 'pb-ta', style: 'min-height:240px' })
+      personaTa.value = mePersona
+      personaTa.addEventListener('input', function () { mePersona = personaTa.value })
+
+      body.appendChild(el('div', { class: 'pb-sep' }, ['称呼（会替换预设里的 {{user}}）']))
+      body.appendChild(nameInput)
+      body.appendChild(el('div', { class: 'pb-sep' }, ['我的人设（注入在预设块之前，支持 {{char}}）']))
+      body.appendChild(personaTa)
+      body.appendChild(el('div', { class: 'pb-foot' }, [
+        el('span', { class: 'pb-meta' }, [mePersona.length + ' 字']),
+        el('button', {
+          class: 'pb-btn primary',
+          onclick: function () {
+            applyPatch({ userName: meName, userPersona: mePersona })
+            view = 'list'
+          },
+        }, ['保存']),
+      ]))
+    } else if (view === 'edit' && editing) {
+      var ta = el('textarea', { class: 'pb-ta' })
+      ta.value = draft
+      ta.addEventListener('input', function () { draft = ta.value })
+      body.appendChild(el('div', { class: 'pb-sep' }, ['名称：' + editing.name + '　角色：' + editing.role]))
+      body.appendChild(ta)
+      body.appendChild(el('div', { class: 'pb-foot' }, [
+        el('button', { class: 'pb-btn', onclick: function () { patchBlock(editing.id, { reset: true }); view = 'list' } }, ['恢复默认']),
+        el('span', { class: 'pb-meta' }, [draft.length + ' 字']),
+        el('button', { class: 'pb-btn primary', onclick: function () { patchBlock(editing.id, { content: draft }); view = 'list' } }, ['保存']),
+      ]))
+    } else if (state) {
+      var list = state.presets || []
+      // 一行状态：不看别的也知道现在到底注入了什么
+      var st = state || {}
+      var cardName = st.activeCard
+        ? st.activeCard
+        : (st.useDefaultRole === false ? '无' : '基础角色（内置）')
+      var hasPersona = !!(st.userPersona && st.userPersona.trim())
+      body.appendChild(el('div', {
+        class: 'pb-status',
+        title: '这三层都会拼进系统提示；总开关关掉则全部不注入',
+      }, [
+        (st.enabled ? '● ' : '○ ') + (st.enabled ? '整套开启' : '整套关闭'),
+        '　预设：' + (st.active || '无') + (st.active ? '' : '（不注入）'),
+        '　卡：' + cardName,
+        '　人设：' + (hasPersona ? st.userName : '无'),
+        '　' + (st.chars || 0) + ' 字',
+        st.fishMemoryOff ? '　🐟已暂停' : '',
+      ]))
+
+      // 与「鱼的记忆」联动
+      var syncCb = el('input', { type: 'checkbox' })
+      syncCb.checked = st.syncFishMemory !== false
+      syncCb.addEventListener('change', function () { applyPatch({ syncFishMemory: syncCb.checked }) })
+      body.appendChild(el('label', {
+        class: 'pb-row',
+        style: 'cursor:pointer;font-size:11px;color:var(--dsw-alias-label-tertiary,#999)',
+        title: '打开总开关时自动停用「鱼的记忆」，关闭时恢复；只恢复它自己关掉的那次',
+      }, [
+        syncCb,
+        el('span', { class: 'pb-name' }, ['开关时同步停用「鱼的记忆」']),
+      ]))
+
+      body.appendChild(el('div', {
+        class: 'pb-row' + (state.active === null ? ' active' : ''),
+        onclick: function () { applyPatch({ active: null }) },
+      }, [el('span', { class: 'pb-name' }, ['（不使用预设）']), el('span', { class: 'pb-meta' }, ['—'])]))
+
+      list.forEach(function (p) {
+        var row = el('div', {
+          class: 'pb-row' + (p.id === state.active ? ' active' : ''),
+          onclick: function () { if (!p.error) applyPatch({ active: p.id, enabled: true }) },
+          title: p.error ? '解析失败' : (p.enabledBlocks + ' / ' + p.blocks.length + ' 块启用'),
+        }, [
+          el('span', { class: 'pb-name' }, [p.id]),
+          el('span', { class: 'pb-meta' }, [p.error ? '!' : (p.enabledBlocks + '/' + p.blocks.length)]),
+        ])
+        var del = el('button', {
+          class: 'pb-btn',
+          style: 'padding:1px 7px;color:' + (pendingDelete === p.id ? '#ff7a7a' : ''),
+          title: pendingDelete === p.id ? '再点一次确认删除' : '删除这个预设',
+        }, [pendingDelete === p.id ? '确认?' : '✕'])
+        del.addEventListener('click', function (ev) {
+          ev.stopPropagation()
+          if (pendingDelete !== p.id) {
+            pendingDelete = p.id
+            render()
+            setTimeout(function () {
+              if (pendingDelete === p.id) { pendingDelete = null; render() }
+            }, 4000)
+            return
+          }
+          pendingDelete = null
+          request('/delete', { method: 'POST', body: JSON.stringify({ id: p.id }) })
+            .then(function (s) { state = s; error = ''; render() })
+            .catch(function (e) { error = String(e.message || e); render() })
+        })
+        row.appendChild(del)
+        body.appendChild(row)
+      })
+
+      if (list.length === 0) {
+        body.appendChild(el('div', { class: 'pb-sep' }, ['把预设 JSON 放到 ' + (state.dir || '~/.dsh/preset-bridge/presets')]))
+      }
+
+      if (preset) {
+        body.appendChild(el('div', { class: 'pb-sep' }, ['「' + preset.id + '」的块（' + preset.blocks.length + '）']))
+        preset.blocks.forEach(function (b) {
+          var cb = el('input', { type: 'checkbox' })
+          cb.checked = !!b.enabled
+          cb.disabled = !!b.placeholder
+          cb.addEventListener('change', function () { patchBlock(b.id, { enabled: cb.checked }) })
+          var row = el('div', { class: 'pb-row' }, [
+            cb,
+            el('span', { class: 'pb-name', style: b.placeholder ? 'opacity:.45' : '' }, [b.name + (b.edited ? ' *' : '')]),
+            el('span', { class: 'pb-meta' }, [b.placeholder ? '占位' : String(b.chars)]),
+          ])
+          if (!b.placeholder) {
+            row.appendChild(el('button', {
+              class: 'pb-btn', style: 'padding:1px 6px',
+              onclick: function (ev) {
+                ev.stopPropagation()
+                editing = b
+                draft = typeof b.content === 'string' ? b.content : ''
+                view = 'edit'
+                render()
+              },
+            }, ['✎']))
+          }
+          body.appendChild(row)
+        })
+      }
+    }
+
+    var foot = el('div', { class: 'pb-foot' }, [
+      (function () {
+        var input = el('input', { type: 'file', accept: '.json', style: 'display:none' })
+        input.addEventListener('change', function () {
+          var f = input.files && input.files[0]
+          input.value = ''
+          if (!f) return
+          f.text().then(function (text) {
+            return request('/import', { method: 'POST', body: JSON.stringify({ name: f.name.replace(/\.json$/i, ''), content: text }) })
+          }).then(function (s) { state = s; error = ''; render() })
+            .catch(function (e) { error = String(e.message || e); render() })
+        })
+        setTimeout(function () { if (!document.body.contains(input)) body.appendChild(input) }, 0)
+        var btn = el('button', { class: 'pb-btn', onclick: function () { input.click() } }, ['导入预设'])
+        var wrap = el('span', null, [btn, input])
+        return wrap
+      })(),
+      el('span', { class: 'pb-meta' }, [on ? (preset.chars + ' 字') : '未启用']),
+    ])
+
+    panel = el('div', { id: 'pb-panel' }, [head, body, foot])
+    host.appendChild(panel)
+    if (panelScroll > 0) body.scrollTop = panelScroll
+  }
+
+  function boot() {
+    if (!document.body) return setTimeout(boot, 300)
+    refresh()
+    setInterval(function () { if (!state) refresh() }, 4000)
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot)
+  else boot()
+})()
