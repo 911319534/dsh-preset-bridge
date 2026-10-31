@@ -150,8 +150,13 @@ export function parsePreset(raw) {
     const scaffold = content
       .replace(/\{\{[^}]*\}\}/g, '')
       .replace(/描述|设定|简介|名字|称呼|description|player|char|user|persona/gi, '')
-      .replace(/[()[\]{}<>\s:：|,，.。\-*_'"]/g, '')
-    if (scaffold === '') continue
+      .replace(/[()[\]{}<>\s:：|,，.。\-*_'"`/]/g, '')
+    // <{{char}}> / </{{char}}> / /char 是 ST 的角色卡槽位标记，内容本身就是标记，
+    // 剥完宏是空的，但必须保留——卡正文要插在它们中间
+    const charSlotMark = /^<\/?\s*\{\{\s*char\s*\}\}\s*>$|^\s*\/char\s*$/i.test(content.trim())
+    if (!charSlotMark && scaffold === '') continue
+    // 世界书占位：ST 在这里插 lorebook，DSH 没有世界书
+    if (/^\[\s*world\s*settings?\s*\]$/i.test(content.trim())) continue
     if (/^\[?\s*(understood|ok|确定)\s*\]?$/i.test(content.trim())) continue
     const isPlaceholder = PLACEHOLDER_IDS.has(id) || content.trim() === ''
     blocks.push({
@@ -208,16 +213,33 @@ export function renderPreset(name, blocks, opts = {}) {
   if (active.length > 0 || persona || cardText) {
     parts.push('（分层优先级：用户当前的明确指令 > 我的设定 > 角色卡 > 预设各块；冲突时以前者为准。）')
   }
-  // 角色卡：AI 扮演谁；放在最前面
-  if (cardText) {
+  // ST 的角色卡槽位：/char 块（内容 </{{char}}>）标出卡正文该插在哪，
+  // 通常还有配对的 char 块（<{{char}}>）把它包起来。有槽位就填进槽位，
+  // 没有才退回「放在最前面」的默认位置。
+  const closeChar = /^<\/\s*\{\{\s*char\s*\}\}\s*>$/
+  const charMark = /^\s*\/char\s*$/i
+  const hasSlot = active.some((b) => closeChar.test(b.content.trim()) || charMark.test(b.content.trim()))
+  if (cardText && !hasSlot) {
     parts.push('', normalize(cardText))
   }
   // 「我的设定」：玩家自己的身份/处境
   if (persona) {
     parts.push('', `### 用户设定（${userName}）`, normalize(persona))
   }
+  const openChar = /^<\s*\{\{\s*char\s*\}\}\s*>$/
   for (const b of active) {
-    parts.push('', `### ${b.name}`, normalize(b.content).trim())
+    const rawContent = b.content.trim()
+    const body = normalize(b.content).trim()
+    const isSlotOpen = openChar.test(rawContent)
+    const isSlotClose = closeChar.test(rawContent)
+    const isSlotMark = isSlotOpen || isSlotClose || charMark.test(rawContent)
+    // 标记块不加「### 块名」标题，否则会变成 ### /char 这种噪音
+    if (!isSlotMark) parts.push('', `### ${b.name}`)
+    // 闭合槽位：卡正文插在闭合标签前面
+    if (cardText && (isSlotClose || charMark.test(rawContent))) {
+      parts.push('', normalize(cardText).trim())
+    }
+    parts.push(body)
   }
   return parts.join('\n').trim()
 }
