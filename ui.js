@@ -1,4 +1,4 @@
-/* preset-bridge UI（注入式，不依赖 client 模块系统） */
+﻿/* preset-bridge UI（注入式，不依赖 client 模块系统） */
 (function () {
   if (window.__presetBridgeMounted) return
   window.__presetBridgeMounted = true
@@ -679,7 +679,7 @@
 
     var scopeBar = el('div', { class: 'pb-scope' + (sessionHint ? '' : ' warn') }, [
       sessionHint
-        ? ('会话：' + (sessionTitleHint || (state && state.sessionTitle) || String(sessionHint).slice(0, 8)) + '　·　只影响这个对话')
+        ? ('会话：' + (sessionTitleHint || (state && state.sessionTitle) || ('…' + String(sessionHint).slice(-6))) + '　·　只影响这个对话')
         : '未能识别当前对话 · 设置会写入默认（所有对话共享）',
     ])
     if (!sessionHint) {
