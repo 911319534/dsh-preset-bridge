@@ -413,29 +413,19 @@
         ? st.activeCard
         : (st.useDefaultRole === false ? '无' : '基础角色（内置）')
       var hasPersona = !!(st.userPersona && st.userPersona.trim())
+      var scopeLabel = st.sessionId
+        ? ('本会话 · ' + String(st.sessionId).slice(-6))
+        : '默认（还没有会话）'
       body.appendChild(el('div', {
         class: 'pb-status',
-        title: '这三层都会拼进系统提示；总开关关掉则全部不注入',
+        title: '设置按会话各自保存；「鱼的记忆」本身也是按会话开关的，这里不再联动',
       }, [
         (st.enabled ? '● ' : '○ ') + (st.enabled ? '整套开启' : '整套关闭'),
+        '　' + scopeLabel,
         '　预设：' + (st.active || '无') + (st.active ? '' : '（不注入）'),
         '　卡：' + cardName,
         '　人设：' + (hasPersona ? st.userName : '无'),
         '　' + (st.chars || 0) + ' 字',
-        st.fishMemoryOff ? '　🐟已暂停' : '',
-      ]))
-
-      // 与「鱼的记忆」联动
-      var syncCb = el('input', { type: 'checkbox' })
-      syncCb.checked = st.syncFishMemory !== false
-      syncCb.addEventListener('change', function () { applyPatch({ syncFishMemory: syncCb.checked }) })
-      body.appendChild(el('label', {
-        class: 'pb-row',
-        style: 'cursor:pointer;font-size:11px;color:var(--dsw-alias-label-tertiary,#999)',
-        title: '打开总开关时自动停用「鱼的记忆」，关闭时恢复；只恢复它自己关掉的那次',
-      }, [
-        syncCb,
-        el('span', { class: 'pb-name' }, ['开关时同步停用「鱼的记忆」']),
       ]))
 
       body.appendChild(el('div', {

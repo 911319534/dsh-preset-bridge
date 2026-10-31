@@ -1,4 +1,4 @@
-/**
+﻿/**
  * preset-bridge · 宿主半边
  *
  * 读 <DSH_HOME>/preset-bridge/presets/*.json（SillyTavern chat-completion 预设），
@@ -78,32 +78,61 @@ async function readJson(file, fallback) {
   }
 }
 
-async function readConfig() {
-  const p = await ensureDirs()
-  const raw = await readJson(p.config, {})
+/** 把任意来源的配置对象规整成完整字段（缺的用默认值补齐） */
+function normalizeConfig(raw = {}) {
   return {
     enabled: raw.enabled !== false,
-    active: typeof raw.active === 'string' ? raw.active : null,
+    active: typeof raw.active === 'string' && raw.active ? raw.active : null,
     // ST 的 {{user}} / {{char}} 在 DSH 里没有对应字段，用这两项顶替
     userName: typeof raw.userName === 'string' && raw.userName.trim() ? raw.userName.trim() : '用户',
     charName: typeof raw.charName === 'string' && raw.charName.trim() ? raw.charName.trim() : '角色',
-    // 「我的设定」：用户自己的人设，注入在预设块之前
+    // 「我的设定」：用户自己的人设
     userPersona: typeof raw.userPersona === 'string' ? raw.userPersona : '',
     // 角色卡：AI 扮演谁
-    activeCard: typeof raw.activeCard === 'string' ? raw.activeCard : null,
-    // 打开总开关时顺手关掉「鱼的记忆」，避免两套记忆/人设打架
-    syncFishMemory: raw.syncFishMemory !== false,
-    // 只把「我们自己关掉的」负责开回来
-    fishMemoryOff: raw.fishMemoryOff === true,
-    // 没选角色卡时，注入内置的「基础角色」（一个 AI 的身份声明）
+    activeCard: typeof raw.activeCard === 'string' && raw.activeCard ? raw.activeCard : null,
+    // 没选角色卡时，注入内置的「基础角色」
     useDefaultRole: raw.useDefaultRole !== false,
   }
 }
 
-async function writeConfig(next) {
-  const p = await ensureDirs()
-  await writeFile(p.config, JSON.stringify(next, null, 2), 'utf8')
+async function readConfig() {
+  return (migrated(await readConfigRaw())).defaults
 }
+
+async function readConfigRaw() {
+  const p = await ensureDirs()
+  return readJson(p.config, {})
+}
+
+/** 老版本的扁平配置迁移成 { defaults, sessions } 结构 */
+function migrated(raw) {
+  if (raw && raw.defaults && typeof raw.defaults === 'object') {
+    return { defaults: normalizeConfig(raw.defaults), sessions: raw.sessions && typeof raw.sessions === 'object' ? raw.sessions : {} }
+  }
+  return { defaults: normalizeConfig(raw), sessions: {} }
+}
+
+/** 某个会话最终生效的配置：默认模板 + 该会话的覆盖 */
+export async function configFor(sid) {
+  const cfg = migrated(await readConfigRaw())
+  if (!sid) return cfg.defaults
+  const patch = cfg.sessions[sid]
+  return patch && typeof patch === 'object' ? normalizeConfig({ ...cfg.defaults, ...patch }) : cfg.defaults
+}
+
+/** 只写这个会话的覆盖，不动别人的 */
+export async function patchSession(sid, patch) {
+  const cfg = migrated(await readConfigRaw())
+  if (sid) {
+    cfg.sessions[sid] = { ...(cfg.sessions[sid] || {}), ...patch }
+  } else {
+    cfg.defaults = { ...cfg.defaults, ...patch }
+  }
+  const p = await ensureDirs()
+  await writeFile(p.config, JSON.stringify(cfg, null, 2), 'utf8')
+  return cfg
+}
+
 
 async function readOverrides() {
   const p = await ensureDirs()
@@ -378,8 +407,26 @@ async function listPresets() {
   return out
 }
 
-async function currentText() {
-  const cfg = await readConfig()
+/** 从装配上下文里取会话 id（不同版本字段名不一样，逐个探） */
+export function sessionIdOf(context) {
+  const s = context?.agent?.session
+  if (!s || typeof s !== 'object') return null
+  for (const k of ['id', 'sessionId', 'key', 'sessionKey', 'sid']) {
+    const v = s[k]
+    if (typeof v === 'string' && v) return v
+  }
+  const h = s.header
+  if (h && typeof h === 'object') {
+    for (const k of ['id', 'sessionId', 'key', 'sessionKey', 'sid']) {
+      const v = h[k]
+      if (typeof v === 'string' && v) return v
+    }
+  }
+  return null
+}
+
+async function currentText(sid) {
+  const cfg = await configFor(sid)
   if (!cfg.enabled) return ''
   const overrides = await readOverrides()
   let cardText = await activeCardText(cfg, overrides)
@@ -433,7 +480,8 @@ function sendJson(res, status, obj) {
 }
 
 export function apply(ctx) {
-  const cache = { text: '' }
+  // key = sessionId（或 '__default__'）→ 该会话拼好的注入文本
+  const cache = new Map()
 
   // ── 注入式 UI ────────────────────────────────────────────────────────────
   // 不走 client 模块系统（那条路在这台机器上加载失败），改为往 index.html
@@ -463,9 +511,13 @@ export function apply(ctx) {
     return html.includes('</body>') ? html.replace('</body>', `${tag}</body>`) : html + tag
   })
 
-  const refresh = async () => {
-    cache.text = await currentText()
-    return cache.text
+  // 每个会话各存一份拼好的文本；lastSid 记录最近一次装配的会话（面板据此判断"本会话"）
+  let lastSid = null
+  const refresh = async (sid) => {
+    const key = sid || '__default__'
+    const text = await currentText(sid)
+    cache.set(key, text)
+    return text
   }
 
   ctx.systemPrompt.section({
@@ -475,23 +527,35 @@ export function apply(ctx) {
     // 而 DSH 会对 section 文本做严格 {{变量}} 插值：遇到未注册变量直接抛错，
     // 导致整轮 agent turn 失败。这里关闭插值，原样注入预设文本。
     interpolate: false,
-    text: () => cache.text,
+    text: (context) => {
+      const sid = sessionIdOf(context)
+      if (sid) lastSid = sid
+      const key = sid || '__default__'
+      const hit = cache.get(key)
+      if (hit !== undefined) return hit
+      // 这个会话还没算过：先返回空，同时排一次计算（下一轮就有）
+      void refresh(sid)
+      return ''
+    },
   })
 
-  void refresh()
+  void refresh(null)
 
-  const state = async () => {
-    const cfg = await readConfig()
+  const state = async (sid) => {
+    const key = sid || lastSid
+    const cfg = await configFor(key)
     const overrides = await readOverrides()
     const cardText = await activeCardText(cfg, overrides)
     return {
       ...cfg,
+      sessionId: key || null,
+      isDefaultScope: !key,
       presets: await listPresets(),
       cards: await listCards(),
       cardChars: cardText.length,
       dir: paths().presets,
       cardsDir: paths().cards,
-      chars: cache.text.length,
+      chars: (cache.get(key || '__default__') || '').length,
     }
   }
 
@@ -502,59 +566,31 @@ export function apply(ctx) {
     path: `${ROUTE_PREFIX}/state`,
     handler: async (req, res) => {
       const method = String(req.method ?? 'GET').toUpperCase()
-      if (method === 'GET') return sendJson(res, 200, await state())
+      if (method === 'GET') return sendJson(res, 200, await state(lastSid))
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
       try {
         const body = JSON.parse((await readBody(req)) || '{}')
-        const cfg = await readConfig()
-        const next = {
-          enabled: typeof body.enabled === 'boolean' ? body.enabled : cfg.enabled,
-          active: body.active === null
-            ? null
-            : typeof body.active === 'string'
-              ? body.active
-              : cfg.active,
-          userName: typeof body.userName === 'string' ? body.userName.slice(0, 60) : cfg.userName,
-          charName: typeof body.charName === 'string' ? body.charName.slice(0, 60) : cfg.charName,
-          userPersona: typeof body.userPersona === 'string'
-            ? body.userPersona.slice(0, 8000)
-            : cfg.userPersona,
-          syncFishMemory: typeof body.syncFishMemory === 'boolean' ? body.syncFishMemory : cfg.syncFishMemory,
-          fishMemoryOff: cfg.fishMemoryOff,
-        }
-        if (body.enabled === true && !next.active) {
+        // 作用域：默认写当前会话；body.scope === 'default' 时才写默认模板
+        const sid = body.scope === 'default' ? null : (typeof body.sessionId === 'string' ? body.sessionId : lastSid)
+        const cfg = await configFor(sid)
+        const patch = {}
+        if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
+        if (body.active === null) patch.active = null
+        else if (typeof body.active === 'string') patch.active = body.active
+        if (typeof body.userName === 'string') patch.userName = body.userName.slice(0, 60)
+        if (typeof body.charName === 'string') patch.charName = body.charName.slice(0, 60)
+        if (typeof body.userPersona === 'string') patch.userPersona = body.userPersona.slice(0, 8000)
+        if (typeof body.activeCard === 'string' || body.activeCard === null) patch.activeCard = body.activeCard
+
+        // 打开总开关时，如果这个会话还没选预设，自动选第一个可用的
+        if (patch.enabled === true && !('active' in patch) && !cfg.active) {
           const presets = await listPresets()
-          next.active = presets.find((x) => !x.error)?.id ?? null
+          patch.active = presets.find((x) => !x.error)?.id ?? null
         }
 
-        // 与「鱼的记忆」联动：开预设就关它，关预设就还它。
-        // 只操作我们自己关掉的那次（fishMemoryOff 记账），不碰用户手动关的状态。
-        const turningOn = next.enabled && !cfg.enabled
-        const turningOff = !next.enabled && cfg.enabled
-        const pm = ctx.get?.('pluginManager') ?? ctx.pluginManager
-        const FISH = 'dsh-fish-memory'
-        if (next.syncFishMemory && pm && (turningOn || turningOff)) {
-          try {
-            if (turningOn) {
-              const list = await pm.listBundles()
-              const bundle = Array.isArray(list) ? list.find((b) => b?.name === FISH) : undefined
-              if (bundle?.enabled) {
-                await pm.setBundleEnabled(FISH, false)
-                next.fishMemoryOff = true
-              }
-            } else if (cfg.fishMemoryOff) {
-              await pm.setBundleEnabled(FISH, true)
-              next.fishMemoryOff = false
-            }
-          } catch (error) {
-            // 联动失败不阻断开关本身，但把原因带回去
-            next.fishMemoryError = error instanceof Error ? error.message : String(error)
-          }
-        }
-
-        await writeConfig(next)
-        await refresh()
-        return sendJson(res, 200, await state())
+        await patchSession(sid, patch)
+        await refresh(sid)
+        return sendJson(res, 200, await state(sid))
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
       }
@@ -597,8 +633,8 @@ export function apply(ctx) {
 
         overrides[preset] = perPreset
         await writeOverrides(overrides)
-        await refresh()
-        return sendJson(res, 200, await state())
+        await refresh(lastSid)
+        return sendJson(res, 200, await state(lastSid))
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
       }
@@ -624,8 +660,8 @@ export function apply(ctx) {
         }
         const p = await ensureDirs()
         await writeFile(join(p.presets, `${name}.json`), JSON.stringify(parsed, null, 2), 'utf8')
-        await refresh()
-        return sendJson(res, 200, { ok: true, id: name, ...(await state()) })
+        await refresh(lastSid)
+        return sendJson(res, 200, { ok: true, id: name, ...(await state(lastSid)) })
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
       }
@@ -653,10 +689,25 @@ export function apply(ctx) {
           delete overrides[id]
           await writeOverrides(overrides)
         }
-        const cfg = await readConfig()
-        if (cfg.active === id) await writeConfig({ ...cfg, active: null })
-        await refresh()
-        return sendJson(res, 200, { ok: true, ...(await state()) })
+        // 删掉的预设如果正被某个会话用着，顺手清掉引用，免得留下悬空的 active
+        const raw = migrated(await readConfigRaw())
+        let touched = false
+        if (raw.defaults.active === id) {
+          raw.defaults.active = null
+          touched = true
+        }
+        for (const [sid, patch] of Object.entries(raw.sessions)) {
+          if (patch && patch.active === id) {
+            raw.sessions[sid] = { ...patch, active: null }
+            touched = true
+          }
+        }
+        if (touched) {
+          const p = await ensureDirs()
+          await writeFile(p.config, JSON.stringify(raw, null, 2), 'utf8')
+        }
+        await refresh(lastSid)
+        return sendJson(res, 200, { ok: true, ...(await state(lastSid)) })
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
       }
@@ -677,7 +728,7 @@ export function apply(ctx) {
           const text = await cardTextOf(wantId, overrides)
           return sendJson(res, 200, { id: wantId, text })
         }
-        return sendJson(res, 200, { cards: await listCards(), activeCard: (await readConfig()).activeCard })
+        return sendJson(res, 200, { cards: await listCards(), activeCard: (await configFor(lastSid)).activeCard, sessionId: lastSid })
       }
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
       try {
@@ -697,17 +748,16 @@ export function apply(ctx) {
           const ext = /\.json$/i.test(String(body.name || '')) ? 'json' : 'png'
           const p = await ensureDirs()
           await writeFile(join(p.cards, `${base}.${ext}`), bytes)
-          await writeConfig({ ...(await readConfig()), activeCard: base })
-          await refresh()
-          return sendJson(res, 200, { ok: true, id: base, name: card.name, ...(await state()) })
+          await patchSession(lastSid, { activeCard: base })
+          await refresh(lastSid)
+          return sendJson(res, 200, { ok: true, id: base, name: card.name, ...(await state(lastSid)) })
         }
 
         if (action === 'select') {
-          const cfg = await readConfig()
           const id = body.id === null ? null : String(body.id || '')
-          await writeConfig({ ...cfg, activeCard: id })
-          await refresh()
-          return sendJson(res, 200, await state())
+          await patchSession(lastSid, { activeCard: id })
+          await refresh(lastSid)
+          return sendJson(res, 200, await state(lastSid))
         }
 
         if (action === 'text') {
@@ -721,8 +771,8 @@ export function apply(ctx) {
             delete overrides[key]
           }
           await writeOverrides(overrides)
-          await refresh()
-          return sendJson(res, 200, await state())
+          await refresh(lastSid)
+          return sendJson(res, 200, await state(lastSid))
         }
 
         if (action === 'delete') {
@@ -734,10 +784,25 @@ export function apply(ctx) {
           const overrides = await readOverrides()
           delete overrides[`card:${id}`]
           await writeOverrides(overrides)
-          const cfg = await readConfig()
-          if (cfg.activeCard === id) await writeConfig({ ...cfg, activeCard: null })
-          await refresh()
-          return sendJson(res, 200, { ok: true, ...(await state()) })
+          // 清掉所有指向这张卡的引用
+          const raw = migrated(await readConfigRaw())
+          let touched = false
+          if (raw.defaults.activeCard === id) {
+            raw.defaults.activeCard = null
+            touched = true
+          }
+          for (const [sid, patch] of Object.entries(raw.sessions)) {
+            if (patch && patch.activeCard === id) {
+              raw.sessions[sid] = { ...patch, activeCard: null }
+              touched = true
+            }
+          }
+          if (touched) {
+            const p2 = await ensureDirs()
+            await writeFile(p2.config, JSON.stringify(raw, null, 2), 'utf8')
+          }
+          await refresh(lastSid)
+          return sendJson(res, 200, { ok: true, ...(await state(lastSid)) })
         }
 
         return sendJson(res, 400, { error: `unknown action: ${action}` })
@@ -750,7 +815,7 @@ export function apply(ctx) {
   disposers.push(ctx.webServer.register({
     kind: 'exact',
     path: `${ROUTE_PREFIX}/preview`,
-    handler: async (_req, res) => sendJson(res, 200, { chars: cache.text.length, text: cache.text }),
+    handler: async (_req, res) => sendJson(res, 200, { chars: (cache.get(lastSid || '__default__') || '').length, text: cache.get(lastSid || '__default__') || '', sessionId: lastSid }),
   }))
 
   // 基础角色：读取 / 保存 / 恢复默认
@@ -781,9 +846,9 @@ export function apply(ctx) {
             await writeFile(p.role, body.text.slice(0, 20000), 'utf8')
           }
         }
-        await refresh()
+        await refresh(lastSid)
         const eff = await readRoleEffective()
-        return sendJson(res, 200, { ok: true, text: eff.text, custom: eff.custom, ...(await state()) })
+        return sendJson(res, 200, { ok: true, text: eff.text, custom: eff.custom, ...(await state(lastSid)) })
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
       }
