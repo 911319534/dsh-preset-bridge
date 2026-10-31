@@ -100,16 +100,43 @@ GET /preset-bridge/ui.js  →  浮动面板（原生 DOM，不依赖框架）
 
 UI 文件按请求读取，**改完刷新页面就生效**，不用重启。
 
+### 按会话独立
+
+设置是**按对话各存一份**的，不是全局一刀切：
+
+```
+调用时：context.agent.session  →  会话 id（形如 session-<uuid>）
+        configFor(会话 id)      →  这个会话的配置
+写入时：只写这个会话的覆盖，不动别的会话，也不动默认模板
+```
+
+面板怎么知道"当前是哪个对话"（DSH 是 SPA，切会话不刷新页面）：
+
+1. 旁观前端自己的请求（`fetch` / `XHR` / `WebSocket`），从请求体里找 `session-<uuid>`
+2. 只认 `session-` 前缀——消息 id、资源 id 也是 UUID，但一律不碰
+3. 换会话时面板自动收起，并恢复那个会话上次的开关状态
+
+面板顶部有一条作用域栏，时刻显示面板绑在哪儿：
+
+```
+会话：…c2b7d0　·　只影响这个对话      ← 绑定成功
+未能识别当前对话 · 设置会写入默认      ← 黄字警告：此刻是共享的（新会话默认模板）
+```
+
+**认不出当前对话时会明确报警，不会假装按会话、实际共享。**
+
 ### HTTP 路由
 
 | 路由 | 作用 |
 |---|---|
-| `GET/POST /preset-bridge/state` | 读状态 / 开关与选项 |
+| `GET/POST /preset-bridge/state` | 读状态 / 开关与选项（都按 `?sid=` 或 `sessionId` 指定会话） |
 | `POST /preset-bridge/block` | 单块开关 / 编辑 |
 | `POST /preset-bridge/import` | 导入预设 |
 | `POST /preset-bridge/delete` | 删除预设 |
 | `GET/POST /preset-bridge/card` | 角色卡列表 / 导入 / 选择 / 编辑 / 删除 |
 | `GET/POST /preset-bridge/role` | 基础角色读取 / 保存 / 恢复默认 |
+| `GET /preset-bridge/checksid?sid=` | 校验某个 id 是不是真会话（顺带返回标题） |
+| `POST /preset-bridge/probe` | 面板上报探测到的会话 id 与来源，写入 `probe.log` |
 | `GET /preset-bridge/preview` | 当前实际会注入的全文 |
 | `GET /preset-bridge/ui.js` | 面板脚本 |
 
@@ -117,12 +144,15 @@ UI 文件按请求读取，**改完刷新页面就生效**，不用重启。
 
 ```
 ~/.dsh/preset-bridge/
-  config.json        # 总开关、当前预设、称呼、人设、联动设置
+  config.json        # { defaults: 默认模板, sessions: { 会话id: 覆盖 } }
   overrides.json     # 逐块开关与编辑、卡面编辑（原文件只读）
   presets/           # 导入的预设 JSON
   cards/             # 导入的角色卡
   default-role.md    # 你改过的基础角色（没有则用包内出厂版）
+  probe.log          # 会话 id 探测日志（排查用，可随时删）
 ```
+
+老版本的扁平 `config.json` 会自动迁移成 `{ defaults, sessions }`，不用手动改。
 
 ## 安装
 
@@ -180,6 +210,20 @@ localStorage.setItem('pb-decode', '1')   // 然后刷新
 **3. 宿主代码改动必须重启**
 
 `index.js` 改完，DSH 不会热重载，只有 `ui.js` 是按请求读的。所以「改了没反应」先看改的是哪个文件。
+
+**4. 会话 id 猜错了两次**
+
+要做「按会话独立」，第一步是让页面里的脚本知道当前是哪个会话。踩了两个坑：
+
+| 尝试 | 结果 |
+|---|---|
+| 从请求 URL 里找 UUID | ❌ DSH 前端走 `api/<服务>/<方法>` 的 RPC，参数在请求体 |
+| 从请求体里找 UUID，见到就认 | ❌ 找到的常是消息 id / 资源 id，绑到了假会话 |
+| 只认 `session-<uuid>` 形状 | ✅ 真会话 id 带这个前缀，其它 UUID 一律不碰 |
+
+中间还有个更隐蔽的：宿主侧读会话要用 `ctx.get('sessions')`（可选获取），写成 `ctx.sessions` 在没声明 `inject` 时是 `undefined`，校验函数永远返回失败。
+
+**教训**：不确定的东西不要"先按看起来对的规则绑上"，要**先报警**。现在的实现认不出来就黄字提醒，至少不会一边说按会话、一边全局共享。
 
 ## 许可
 
