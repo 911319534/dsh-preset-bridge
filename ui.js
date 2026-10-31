@@ -14,16 +14,21 @@
   // MutationObserver 把渲染器拖死过），而是旁观前端自己的请求，从 URL 里
   // 认出会话 id（UUID）。拿到后：面板状态按会话存，切会话就自动收起。
   var sessionHint = null
+  var sessionTitleHint = ''
   var openBySession = {}
-  var UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
+  // DSH 的会话 id 是 session- 开头；只认这个形状，别的 UUID（消息/资源）一律不碰
+  var SID_RE = /session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
 
   var reqLog = []
+  var rejectedIds = {}
+  var checkingId = null
 
   /** 采纳一个会话 id：记下旧会话的面板状态，切到新的，收起面板 */
-  function adoptSession(id) {
+  function adoptSession(id, title) {
     if (!id || id === sessionHint) return
     if (sessionHint) openBySession[sessionHint] = open
     sessionHint = id
+    sessionTitleHint = title || ''
     open = openBySession[id] === true ? true : false
     state = null
     view = 'list'
@@ -32,31 +37,49 @@
     refresh()
   }
 
-  function noteSessionId(url) {
+  /** 认到 session- 开头的 id 就采纳；标题去问宿主，拿不到也不影响绑定 */
+  function considerSession(id) {
+    if (!id || id === sessionHint) return
+    adoptSession(id, '')
+    var rawFetch = window.__pbOrigFetch || window.fetch
     try {
-      var urlStr = String(url || '')
-      var m = UUID_RE.exec(urlStr)
-      if (!m) return
-      var id = m[1].toLowerCase()
-      // 高置信度：URL 路径里带 session/conversation/chat；否则只有在还没绑定时才采纳，
-      // 免得把消息 id 之类的 UUID 误当成会话 id 换来换去
-      var confident = /session|conversation|\/chat\b|chats?\//i.test(urlStr)
-      if (confident || !sessionHint) adoptSession(id)
+      rawFetch.call(window, API + '/checksid?sid=' + encodeURIComponent(id), { headers: { accept: 'application/json' } })
+        .then(function (r) { return r.json() })
+        .then(function (d) {
+          if (d && d.ok && d.title && id === sessionHint) {
+            sessionTitleHint = String(d.title)
+            render()
+          }
+        })
+        .catch(function () { /* 标题拿不到就算了 */ })
     } catch (e) { /* ignore */ }
   }
 
-  /** 看请求体 / WebSocket 消息：里面往往才是真正的 RPC 参数 */
+  function noteSessionId(url) {
+    try {
+      var urlStr = String(url || '')
+      var m = SID_RE.exec(urlStr)
+      if (m) considerSession(m[0].toLowerCase())
+    } catch (e) { /* ignore */ }
+  }
+
+  /** 看请求体 / WebSocket 消息：DSH 的 RPC 参数都在这里 */
   function noteBody(text, source) {
     try {
       if (!text || text.length > 20000) return
+      var method = ''
       var keys = ''
       if (text.charAt(0) === '{') {
-        try { keys = Object.keys(JSON.parse(text)).slice(0, 10).join(',') } catch (e) { keys = '' }
+        try {
+          var obj = JSON.parse(text)
+          keys = Object.keys(obj).slice(0, 10).join(',')
+          if (typeof obj.method === 'string') method = obj.method.slice(0, 40)
+        } catch (e) { keys = '' }
       }
-      var m = UUID_RE.exec(text)
-      reqLog.push({ s: source, k: keys, u: m ? m[1].slice(0, 6) : '' })
+      var m = SID_RE.exec(text)
+      reqLog.push({ s: source, k: method || keys, u: m ? m[0].slice(0, 12) : '' })
       if (reqLog.length > 30) reqLog.shift()
-      if (m && !sessionHint) adoptSession(m[1].toLowerCase())
+      if (m) considerSession(m[0].toLowerCase())
     } catch (e) { /* ignore */ }
   }
 
@@ -656,7 +679,7 @@
 
     var scopeBar = el('div', { class: 'pb-scope' + (sessionHint ? '' : ' warn') }, [
       sessionHint
-        ? ('会话：' + ((state && state.sessionTitle) || String(sessionHint).slice(0, 8)) + '　·　只影响这个对话')
+        ? ('会话：' + (sessionTitleHint || (state && state.sessionTitle) || String(sessionHint).slice(0, 8)) + '　·　只影响这个对话')
         : '未能识别当前对话 · 设置会写入默认（所有对话共享）',
     ])
     if (!sessionHint) {

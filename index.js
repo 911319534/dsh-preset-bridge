@@ -559,9 +559,9 @@ export function apply(ctx) {
   const titleOf = (sid) => {
     if (!sid) return ''
     try {
-      const s = ctx.sessions?.get?.(sid)
+      const s = ctx.get?.('sessions')?.get?.(sid)
       if (!s) return ''
-      const snap = ctx.sessionTitle?.get?.(s)
+      const snap = ctx.get?.('sessionTitle')?.get?.(s)
       return snap && snap.title ? String(snap.title) : ''
     } catch {
       return ''
@@ -839,6 +839,30 @@ export function apply(ctx) {
         return sendJson(res, 400, { error: `unknown action: ${action}` })
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  // 探针报上来一个 UUID，问宿主「这到底是不是会话 id」：是就返回标题，不是就 ok:false。
+  // 这样前端请求里混着的消息 id / 资源 id 不会被误当成会话。
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/checksid`,
+    handler: async (req, res) => {
+      let sid = ''
+      try {
+        sid = new URL(String(req.url || '/'), 'http://x').searchParams.get('sid') || ''
+      } catch {
+        sid = ''
+      }
+      if (!sid) return sendJson(res, 200, { ok: false })
+      try {
+        const s = ctx.get?.('sessions')?.get?.(sid)
+        if (!s) return sendJson(res, 200, { ok: false })
+        const snap = ctx.get?.('sessionTitle')?.get?.(s)
+        return sendJson(res, 200, { ok: true, sid, title: snap && snap.title ? String(snap.title) : '' })
+      } catch {
+        return sendJson(res, 200, { ok: false })
       }
     },
   }))
