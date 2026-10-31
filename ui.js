@@ -1,4 +1,4 @@
-/* preset-bridge UI（注入式，不依赖 client 模块系统） */
+﻿/* preset-bridge UI（注入式，不依赖 client 模块系统） */
 (function () {
   if (window.__presetBridgeMounted) return
   window.__presetBridgeMounted = true
@@ -8,6 +8,57 @@
   var open = false
   var view = 'list'
   var editing = null
+
+  // ── 当前会话探测 ──────────────────────────────────────────────────────────
+  // 面板是页面级的，切换会话时页面不刷新。这里不监听 DOM（上次全文档
+  // MutationObserver 把渲染器拖死过），而是旁观前端自己的请求，从 URL 里
+  // 认出会话 id（UUID）。拿到后：面板状态按会话存，切会话就自动收起。
+  var sessionHint = null
+  var openBySession = {}
+  var UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
+
+  function noteSessionId(url) {
+    try {
+      var m = UUID_RE.exec(String(url || ''))
+      if (!m) return
+      var id = m[1].toLowerCase()
+      if (id === sessionHint) return
+      // 记住旧会话的面板状态
+      if (sessionHint) openBySession[sessionHint] = open
+      sessionHint = id
+      // 换会话：收起面板，避免在另一个对话里还开着
+      open = openBySession[id] === true ? true : false
+      state = null
+      view = 'list'
+      editing = null
+      render()
+      refresh()
+    } catch (e) { /* ignore */ }
+  }
+
+  function installSessionProbe() {
+    try {
+      var origFetch = window.fetch
+      if (typeof origFetch === 'function' && !window.__pbFetchPatched) {
+        window.__pbFetchPatched = true
+        window.fetch = function (input) {
+          try {
+            var u = typeof input === 'string' ? input : (input && input.url) || ''
+            noteSessionId(u)
+          } catch (e) { /* ignore */ }
+          return origFetch.apply(this, arguments)
+        }
+      }
+      var XO = XMLHttpRequest.prototype.open
+      if (typeof XO === 'function' && !window.__pbXhrPatched) {
+        window.__pbXhrPatched = true
+        XMLHttpRequest.prototype.open = function (method, url) {
+          try { noteSessionId(url) } catch (e) { /* ignore */ }
+          return XO.apply(this, arguments)
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
 
   // ── 显示层解码：把正文里的 \uXXXX 还原成汉字（只改显示，不改模型行为）──
   // 默认关闭：全局扫描/改写文本会把主线程拖死，且与开屏类插件抢 DOM。
@@ -95,9 +146,22 @@
   }
 
   function request(path, init) {
-    return fetch(API + path, Object.assign({
+    // 每个请求都带上探测到的会话 id，宿主据此读写「这个会话」的配置
+    var sep = path.indexOf('?') === -1 ? '?' : '&'
+    var url = API + path + (sessionHint ? sep + 'sid=' + encodeURIComponent(sessionHint) : '')
+    var opts = Object.assign({
       headers: { 'content-type': 'application/json', accept: 'application/json' },
-    }, init || {})).then(function (res) {
+    }, init || {})
+    if (opts.body && sessionHint) {
+      try {
+        var parsed = JSON.parse(opts.body)
+        if (parsed && typeof parsed === 'object' && !parsed.sessionId) {
+          parsed.sessionId = sessionHint
+          opts.body = JSON.stringify(parsed)
+        }
+      } catch (e) { /* 原样发 */ }
+    }
+    return fetch(url, opts).then(function (res) {
       return res.json().catch(function () { return {} }).then(function (data) {
         if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status))
         return data
@@ -161,6 +225,10 @@
     document.body.appendChild(root)
     return root
   }
+
+  // 启动就装探针，然后拉一次状态
+  installSessionProbe()
+  setTimeout(function () { refresh() }, 0)
 
   function render() {
     var host = ensureRoot()

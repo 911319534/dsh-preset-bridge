@@ -542,6 +542,18 @@ export function apply(ctx) {
 
   void refresh(null)
 
+  // 请求里带来的会话 id 优先（面板会带），其次用最近一次装配的会话
+  const sidFromReq = (req, body) => {
+    if (body && typeof body.sessionId === 'string' && body.sessionId) return body.sessionId
+    try {
+      const q = new URL(String(req.url || '/'), 'http://x').searchParams.get('sid')
+      if (q) return q
+    } catch {
+      // ignore
+    }
+    return lastSid
+  }
+
   const state = async (sid) => {
     const key = sid || lastSid
     const cfg = await configFor(key)
@@ -567,12 +579,12 @@ export function apply(ctx) {
     path: `${ROUTE_PREFIX}/state`,
     handler: async (req, res) => {
       const method = String(req.method ?? 'GET').toUpperCase()
-      if (method === 'GET') return sendJson(res, 200, await state(lastSid))
+      if (method === 'GET') return sendJson(res, 200, await state(sidFromReq(req)))
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
       try {
         const body = JSON.parse((await readBody(req)) || '{}')
         // 作用域：默认写当前会话；body.scope === 'default' 时才写默认模板
-        const sid = body.scope === 'default' ? null : (typeof body.sessionId === 'string' ? body.sessionId : lastSid)
+        const sid = body.scope === 'default' ? null : sidFromReq(req, body)
         const cfg = await configFor(sid)
         const patch = {}
         if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
@@ -729,7 +741,8 @@ export function apply(ctx) {
           const text = await cardTextOf(wantId, overrides)
           return sendJson(res, 200, { id: wantId, text })
         }
-        return sendJson(res, 200, { cards: await listCards(), activeCard: (await configFor(lastSid)).activeCard, sessionId: lastSid })
+        const sid = sidFromReq(req);
+        return sendJson(res, 200, { cards: await listCards(), activeCard: (await configFor(sid)).activeCard, sessionId: sid })
       }
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
       try {
@@ -749,16 +762,18 @@ export function apply(ctx) {
           const ext = /\.json$/i.test(String(body.name || '')) ? 'json' : 'png'
           const p = await ensureDirs()
           await writeFile(join(p.cards, `${base}.${ext}`), bytes)
-          await patchSession(lastSid, { activeCard: base })
-          await refresh(lastSid)
-          return sendJson(res, 200, { ok: true, id: base, name: card.name, ...(await state(lastSid)) })
+          const sid = sidFromReq(req, body)
+          await patchSession(sid, { activeCard: base })
+          await refresh(sid)
+          return sendJson(res, 200, { ok: true, id: base, name: card.name, ...(await state(sid)) })
         }
 
         if (action === 'select') {
           const id = body.id === null ? null : String(body.id || '')
-          await patchSession(lastSid, { activeCard: id })
-          await refresh(lastSid)
-          return sendJson(res, 200, await state(lastSid))
+          const sid = sidFromReq(req, body)
+          await patchSession(sid, { activeCard: id })
+          await refresh(sid)
+          return sendJson(res, 200, await state(sid))
         }
 
         if (action === 'text') {
