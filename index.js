@@ -478,9 +478,12 @@ export function sessionIdOf(context) {
 
 async function currentText(sid) {
   const cfg = await configFor(sid)
-  // 总开关是"整套"，关掉时人格也不注入
-  if (!cfg.enabled) return ''
+  // 人格是"我是谁"，跟预设开关无关：选了就该一直在
   const personaDoc = cfg.personaFile ? await readPersona(cfg.personaFile) : null
+  if (!cfg.enabled) {
+    // 预设关着也要保留人格
+    return personaDoc ? renderPreset('', [], { personaDoc }) : ''
+  }
   const overrides = await readOverrides()
   let cardText = await activeCardText(cfg, overrides)
   // 基础角色只在「开了预设但没选卡」时兜底；没开预设就不注入，保持干净
