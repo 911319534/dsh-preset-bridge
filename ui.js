@@ -17,6 +17,21 @@
   var openBySession = {}
   var UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
 
+  var reqLog = []
+
+  /** 采纳一个会话 id：记下旧会话的面板状态，切到新的，收起面板 */
+  function adoptSession(id) {
+    if (!id || id === sessionHint) return
+    if (sessionHint) openBySession[sessionHint] = open
+    sessionHint = id
+    open = openBySession[id] === true ? true : false
+    state = null
+    view = 'list'
+    editing = null
+    render()
+    refresh()
+  }
+
   function noteSessionId(url) {
     try {
       var urlStr = String(url || '')
@@ -26,27 +41,22 @@
       // 高置信度：URL 路径里带 session/conversation/chat；否则只有在还没绑定时才采纳，
       // 免得把消息 id 之类的 UUID 误当成会话 id 换来换去
       var confident = /session|conversation|\/chat\b|chats?\//i.test(urlStr)
-      var accept = confident || !sessionHint
-      // 一律记一条探针日志，方便事后核对到底哪些 URL 带会话 id
-      try {
-        var rawFetch = window.__pbOrigFetch || window.fetch
-        rawFetch.call(window, API + '/probe', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sid: id, url: urlStr, accepted: accept, confident: confident }),
-        })
-      } catch (e) { /* ignore */ }
-      if (!accept || id === sessionHint) return
-      // 记住旧会话的面板状态
-      if (sessionHint) openBySession[sessionHint] = open
-      sessionHint = id
-      // 换会话：收起面板，避免在另一个对话里还开着
-      open = openBySession[id] === true ? true : false
-      state = null
-      view = 'list'
-      editing = null
-      render()
-      refresh()
+      if (confident || !sessionHint) adoptSession(id)
+    } catch (e) { /* ignore */ }
+  }
+
+  /** 看请求体 / WebSocket 消息：里面往往才是真正的 RPC 参数 */
+  function noteBody(text, source) {
+    try {
+      if (!text || text.length > 20000) return
+      var keys = ''
+      if (text.charAt(0) === '{') {
+        try { keys = Object.keys(JSON.parse(text)).slice(0, 10).join(',') } catch (e) { keys = '' }
+      }
+      var m = UUID_RE.exec(text)
+      reqLog.push({ s: source, k: keys, u: m ? m[1].slice(0, 6) : '' })
+      if (reqLog.length > 30) reqLog.shift()
+      if (m && !sessionHint) adoptSession(m[1].toLowerCase())
     } catch (e) { /* ignore */ }
   }
 
@@ -56,10 +66,12 @@
       if (typeof origFetch === 'function' && !window.__pbFetchPatched) {
         window.__pbFetchPatched = true
         window.__pbOrigFetch = origFetch
-        window.fetch = function (input) {
+        window.fetch = function (input, init) {
           try {
             var u = typeof input === 'string' ? input : (input && input.url) || ''
+            var body = init && typeof init.body === 'string' ? init.body : null
             noteSessionId(u)
+            if (body) noteBody(body, u)
           } catch (e) { /* ignore */ }
           return origFetch.apply(this, arguments)
         }
@@ -71,6 +83,37 @@
           try { noteSessionId(url) } catch (e) { /* ignore */ }
           return XO.apply(this, arguments)
         }
+        var XS = XMLHttpRequest.prototype.send
+        XMLHttpRequest.prototype.send = function (data) {
+          try {
+            if (typeof data === 'string') noteBody(data, 'xhr')
+          } catch (e) { /* ignore */ }
+          return XS.apply(this, arguments)
+        }
+      }
+      // WebSocket：很多前端把 RPC 走 ws，会话 id 在消息体里。
+      // 只包 prototype 的 send/addEventListener，不替换构造函数（换构造容易影响前端判断）。
+      var WS = window.WebSocket
+      if (typeof WS === 'function' && WS.prototype && !window.__pbWsPatched) {
+        window.__pbWsPatched = true
+        try {
+          var sendP = WS.prototype.send
+          WS.prototype.send = function (data) {
+            try { if (typeof data === 'string') noteBody(data, 'ws-out') } catch (e) { /* ignore */ }
+            return sendP.call(this, data)
+          }
+          var addP = WS.prototype.addEventListener
+          WS.prototype.addEventListener = function (type, fn, opts) {
+            if (type === 'message' && typeof fn === 'function') {
+              var wrapped = function (ev) {
+                try { if (ev && typeof ev.data === 'string') noteBody(ev.data, 'ws-in') } catch (e) { /* ignore */ }
+                return fn.call(this, ev)
+              }
+              return addP.call(this, type, wrapped, opts)
+            }
+            return addP.call(this, type, fn, opts)
+          }
+        } catch (e) { /* ignore */ }
       }
     } catch (e) { /* ignore */ }
   }
@@ -126,6 +169,7 @@
     'color:var(--dsw-alias-label-primary,#eee);font:12px/1.5 -apple-system,"Segoe UI",sans-serif;box-shadow:0 12px 36px rgba(0,0,0,.55);overflow:hidden}',
     '#pb-panel .pb-scope{padding:5px 12px;font-size:11px;color:var(--dsw-alias-label-secondary,#aaa);border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.15))}',
     '#pb-panel .pb-scope.warn{color:#e0b062}',
+    '#pb-panel .pb-diag{font-size:10px;opacity:.75;margin-top:3px;line-height:1.5;word-break:break-all}',
     '#pb-fab.unattached{color:#e0b062}',
     '#pb-panel .pb-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
     '#pb-panel .pb-body{padding:8px;overflow:auto}',
@@ -610,7 +654,19 @@
       el('span', { class: 'pb-meta' }, [on ? (preset.chars + ' 字') : '未启用']),
     ])
 
-    var scopeBar = el('div', { class: 'pb-scope' + (sessionHint ? '' : ' warn') }, [sessionHint ? ('会话：' + ((state && state.sessionTitle) || String(sessionHint).slice(0, 8)) + '　·　只影响这个对话') : '未能识别当前对话 · 设置会写入默认（所有对话共享）'])
+    var scopeBar = el('div', { class: 'pb-scope' + (sessionHint ? '' : ' warn') }, [
+      sessionHint
+        ? ('会话：' + ((state && state.sessionTitle) || String(sessionHint).slice(0, 8)) + '　·　只影响这个对话')
+        : '未能识别当前对话 · 设置会写入默认（所有对话共享）',
+    ])
+    if (!sessionHint) {
+      var seen = reqLog.slice(-6).map(function (r) {
+        return r.s + (r.k ? '[' + r.k + ']' : '') + (r.u ? ' ' + r.u : '')
+      }).join(' · ')
+      scopeBar.appendChild(el('div', { class: 'pb-diag' }, [
+        seen ? ('探针看到：' + seen) : '探针还没抓到任何请求（发一条消息或切个会话试试）',
+      ]))
+    }
     panel = el('div', { id: 'pb-panel' }, [head, scopeBar, body, foot])
     host.appendChild(panel)
     if (panelScroll > 0) body.scrollTop = panelScroll
